@@ -2,6 +2,11 @@
 
 **半自動映像構成装置 / Promnica**
 
+<img width="1919" height="1042" alt="image" src="https://github.com/user-attachments/assets/4dcc6d3a-38d6-4811-a41a-80440e644ff5" />
+
+<img width="1254" height="769" alt="image" src="https://github.com/user-attachments/assets/dcda9e13-77fe-4adf-a59e-4b982835831e" />
+
+
 画面録画と台本から、VOICEVOXナレーション・字幕・元動画音声を合成し、ショート動画向けMP4を組み立てるWindows用デスクトップツールです。
 
 MONTAZHはフル機能の動画編集ソフトではなく、**録画と台本を投入し、配置案を人間が必要な箇所だけ直して完成動画を出す**ことを目的にしています。
