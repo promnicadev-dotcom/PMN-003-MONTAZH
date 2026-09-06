@@ -1,6 +1,6 @@
 # PMN-003 MONTAZH
 
-**半自動映像構成装置 / Promnica**
+**半自動映像構成装置**
 
 <img width="1919" height="1042" alt="image" src="https://github.com/user-attachments/assets/4dcc6d3a-38d6-4811-a41a-80440e644ff5" />
 
