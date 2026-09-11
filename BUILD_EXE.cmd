@@ -9,5 +9,7 @@ if errorlevel 1 (
   exit /b 1
 )
 echo.
-echo Build completed. See dist\PMN-003_MONTAZH\
+echo Build completed.
+echo The distributable ZIP is in the release folder.
+echo Do NOT distribute only PMN-003_MONTAZH.exe; the _internal folder is required.
 pause

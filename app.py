@@ -6,7 +6,9 @@ import json
 import os
 import queue
 import re
+import shutil
 import subprocess
+import time
 import sys
 import tempfile
 import threading
@@ -22,15 +24,16 @@ from audio_preview import play_wav
 from timeline_widget import TimelineEditor
 from video_preview import VideoPreview
 from engine import (ACCENT, BG, PRESETS, ROOT, VERSION, CUSTOM_ENGINE, DEFAULT_ENGINE_URL, DEFAULT_SPEAKER_LABEL,
-                    ENGINE_PRESETS, NEMO_ENGINE, Cancelled, FactoryError, engine_preset,
+                    OUTPUT_MODES, SHORT_MODE, NORMAL_MODE, SHORT_PRESETS, NORMAL_PRESETS, THEMES, DEFAULT_THEME,
+                    ENGINE_PRESETS, NEMO_ENGINE, Cancelled, FactoryError, engine_preset, theme_colors,
                     Settings, Voicevox, build_review_plan, default_output_root, ensure_output_folders,
                     load_project, parse_script, preview_frame, remove_script_scenes, render, save_project, validate_settings,
-                    OVERLAP_TOLERANCE)
+                    OVERLAP_TOLERANCE, USER_SETTINGS_SCHEMA_VERSION)
 
-EXAMPLE = """人類は、動画編集に時間を使いすぎる。
-そこで私は、動画自動製造機を製造した。
-録画と台本を投入。音声と字幕を自動合成する。
-人類の仕事は、完成品の確認だ。
+EXAMPLE = """これはサンプル動画です。
+録画と台本から、音声と字幕を自動で構成します。
+必要に応じて、読み上げ位置を調整できます。
+内容を確認したら、MP4を書き出します。
 """
 
 
@@ -40,6 +43,33 @@ def open_file(path: Path):
     else:
         subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open", str(path)],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def _hex_to_rgb(value: str) -> tuple[int, int, int]:
+    value = value.strip().lstrip("#")
+    if len(value) != 6:
+        raise ValueError(f"Unsupported color: {value}")
+    return tuple(int(value[i:i+2], 16) for i in (0, 2, 4))
+
+
+def _rgb_to_hex(rgb: tuple[int, int, int]) -> str:
+    return "#%02x%02x%02x" % tuple(max(0, min(255, int(round(v)))) for v in rgb)
+
+
+def _mix(color_a: str, color_b: str, ratio: float) -> str:
+    ratio = max(0.0, min(1.0, float(ratio)))
+    a = _hex_to_rgb(color_a)
+    b = _hex_to_rgb(color_b)
+    return _rgb_to_hex(tuple(a[i] * (1.0 - ratio) + b[i] * ratio for i in range(3)))
+
+
+def _luminance(color: str) -> float:
+    r, g, b = _hex_to_rgb(color)
+    return (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0
+
+
+def _is_light(color: str) -> bool:
+    return _luminance(color) >= 0.62
 
 
 class FactoryApp(tk.Tk):
@@ -52,11 +82,19 @@ class FactoryApp(tk.Tk):
         self.events = queue.Queue()
         self.stop = threading.Event()
         self.busy = False
+        self.busy_state = "IDLE"
         self.audition_active = False
         self.close_after_idle = False
         self.speakers: dict[str, int] = {}
         self.loaded_engine_url = ""
         self.last_output: Path | None = None
+        self.current_project: Path | None = None
+        self._voicevox_start_attempted: set[str] = set()
+        self._voicevox_process = None
+        self._user_settings_writable = True
+        # Local-only executable preference. Keep this outside project files so an
+        # imported .montazh file can never choose a program to execute.
+        self.voicevox_dir_path = tk.StringVar(value="")
         self.review_states: list[dict] = []
         self.review_popup = None
         self.preview_directory = tempfile.TemporaryDirectory(prefix="pmn003_ui_")
@@ -64,34 +102,33 @@ class FactoryApp(tk.Tk):
         self.controls = []
         self._style()
         self._build()
-        self.after_idle(self._maximize_initial)
         self.vars["engine_url"].trace_add("write", self._engine_url_changed)
+        self.vars["theme_id"].trace_add("write", self._theme_changed)
+        self._apply_ui_theme()
         self.protocol("WM_DELETE_WINDOW", self._close)
         self.after(100, self._drain)
+        self._load_user_settings()
         self._load_last()
+        self._write_app_log(f"MONTAZH {VERSION} started")
         # Routine use should not require pressing 「声を読み込み」 every launch.
         # If VOICEVOX is already running, silently load the list and select the saved/default voice.
         self.after(250, self._autoload_voices)
 
 
     def _set_good_initial_geometry(self):
-        """Use almost all available space; Windows is maximized after the UI is built."""
+        """Open at a large, centered working size without forcing maximized mode."""
         self.update_idletasks()
         sw = max(1024, self.winfo_screenwidth())
         sh = max(768, self.winfo_screenheight())
-        w = min(1760, max(1220, int(sw * 0.96)))
-        h = min(1020, max(820, int(sh * 0.93)))
+        # 1920x1080 -> 1600x900, matching the intended comfortable desktop size.
+        # On smaller displays, leave a little room for borders/taskbar.
+        w = min(1600, max(1100, sw - 96))
+        h = min(900, max(760, sh - 120))
+        w = min(w, sw - 24)
+        h = min(h, sh - 48)
         x = max(0, (sw - w) // 2)
-        y = max(0, (sh - h) // 3)
+        y = max(0, (sh - h) // 2)
         self.geometry(f"{w}x{h}+{x}+{y}")
-
-    def _maximize_initial(self):
-        """On Windows, start maximized so preview/review actions are not below the fold."""
-        if os.name == "nt":
-            try:
-                self.state("zoomed")
-            except tk.TclError:
-                pass
 
     @staticmethod
     def _fit_popup_to_screen(window, width=1680, height=1000):
@@ -109,38 +146,87 @@ class FactoryApp(tk.Tk):
 
     def _style(self):
         self.option_add("*Font", ("Yu Gothic UI", 10))
-        self.option_add("*TCombobox*Listbox.background", "#223042")
-        self.option_add("*TCombobox*Listbox.foreground", "#edf3f7")
         style = ttk.Style(self)
         style.theme_use("clam")
-        style.configure(".", background=BG, foreground="#edf3f7", font=("Yu Gothic UI", 10))
-        style.configure("TFrame", background=BG)
-        style.configure("TLabel", background=BG)
-        style.configure("Muted.TLabel", foreground="#a9b7c7")
-        style.configure("Title.TLabel", foreground=ACCENT, font=("Yu Gothic UI", 22, "bold"))
-        style.configure("TLabelframe", background=BG, bordercolor="#344256")
-        style.configure("TLabelframe.Label", foreground=ACCENT)
-        style.configure("TButton", padding=(11, 7), background="#263649", bordercolor="#344256")
-        style.map("TButton", background=[("active", "#39516b"), ("disabled", "#1d2836")],
-                  foreground=[("disabled", "#697787")])
-        style.configure("Accent.TButton", background=ACCENT, foreground="#101722", font=("Yu Gothic UI", 12, "bold"))
-        style.map("Accent.TButton", background=[("active", "#a1efd9"), ("disabled", "#354a49")])
+
+    def _current_theme_colors(self) -> dict[str, str]:
+        theme_id = self.vars.get("theme_id").get() if self.vars.get("theme_id") else DEFAULT_THEME
+        return THEMES.get(theme_id, THEMES[DEFAULT_THEME])
+
+    def _theme_changed(self, *_):
+        self._apply_ui_theme()
+
+    def _apply_ui_theme(self):
+        colors = self._current_theme_colors()
+        bg = colors["bg"]
+        text = colors["text"]
+        accent = colors["accent"]
+        muted = colors["muted"]
+        light = _is_light(bg)
+        field = _mix(bg, text, 0.10 if light else 0.08)
+        panel = _mix(bg, text, 0.07 if light else 0.06)
+        panel_active = _mix(panel, accent, 0.22)
+        border = _mix(bg, text, 0.23 if light else 0.18)
+        disabled_bg = _mix(bg, text, 0.05)
+        disabled_fg = _mix(muted, text, 0.15)
+        select_bg = _mix(accent, bg, 0.42)
+        select_fg = text if _luminance(select_bg) < 0.60 else bg
+        accent_fg = bg if _luminance(accent) >= 0.56 else text
+        review_row = _mix(bg, text, 0.11 if light else 0.07)
+        review_heading = _mix(bg, text, 0.18 if light else 0.12)
+
+        self.option_add("*TCombobox*Listbox.background", field)
+        self.option_add("*TCombobox*Listbox.foreground", text)
+
+        style = ttk.Style(self)
+        style.configure(".", background=bg, foreground=text, font=("Yu Gothic UI", 10))
+        style.configure("TFrame", background=bg)
+        style.configure("TLabel", background=bg, foreground=text)
+        style.configure("Muted.TLabel", background=bg, foreground=muted)
+        style.configure("Title.TLabel", background=bg, foreground=accent, font=("Yu Gothic UI", 22, "bold"))
+        style.configure("TLabelframe", background=bg, bordercolor=border, lightcolor=border, darkcolor=border)
+        style.configure("TLabelframe.Label", background=bg, foreground=accent)
+        style.configure("TButton", padding=(11, 7), background=panel, foreground=text, bordercolor=border, lightcolor=border, darkcolor=border)
+        style.map("TButton", background=[("active", panel_active), ("disabled", disabled_bg)],
+                  foreground=[("disabled", disabled_fg)])
+        style.configure("Accent.TButton", background=accent, foreground=accent_fg, bordercolor=accent,
+                        lightcolor=accent, darkcolor=accent, font=("Yu Gothic UI", 12, "bold"))
+        style.map("Accent.TButton", background=[("active", _mix(accent, text, 0.18)), ("disabled", disabled_bg)],
+                  foreground=[("disabled", disabled_fg)])
         for name in ("TEntry", "TCombobox", "TSpinbox"):
-            style.configure(name, fieldbackground="#1b2838", foreground="#edf3f7", padding=5,
-                            insertcolor="#ffffff", arrowcolor="#edf3f7", bordercolor="#344256")
-            style.map(name, fieldbackground=[("readonly", "#1b2838")], foreground=[("readonly", "#edf3f7")])
-        style.configure("Horizontal.TProgressbar", background=ACCENT, troughcolor="#223042", bordercolor=BG)
-        # 配置確認画面は、長時間見ても文字が埋もれない高コントラスト配色にする。
-        style.configure("Review.Treeview", background="#182433", fieldbackground="#182433",
-                        foreground="#f4f7fa", rowheight=28, bordercolor="#46566b")
-        style.map("Review.Treeview",
-                  background=[("selected", "#356f8d")],
-                  foreground=[("selected", "#ffffff")])
-        style.configure("Review.Treeview.Heading", background="#2b3b4f", foreground="#ffffff",
+            style.configure(name, fieldbackground=field, foreground=text, padding=5,
+                            insertcolor=text, arrowcolor=text, bordercolor=border, lightcolor=border, darkcolor=border)
+            style.map(name, fieldbackground=[("readonly", field)], foreground=[("readonly", text)])
+        style.configure("TCheckbutton", background=bg, foreground=text)
+        style.map("TCheckbutton", foreground=[("disabled", disabled_fg)])
+        style.configure("Horizontal.TProgressbar", background=accent, troughcolor=field, bordercolor=bg)
+        style.configure("Review.Treeview", background=review_row, fieldbackground=review_row,
+                        foreground=text, rowheight=28, bordercolor=border)
+        style.map("Review.Treeview", background=[("selected", select_bg)], foreground=[("selected", select_fg)])
+        style.configure("Review.Treeview.Heading", background=review_heading, foreground=text,
                         font=("Yu Gothic UI", 10, "bold"), relief="flat")
-        style.map("Review.Treeview.Heading", background=[("active", "#3b5068")])
-        style.configure("ReviewPanel.TLabel", foreground="#f4f7fa", background=BG)
-        style.configure("ReviewMuted.TLabel", foreground="#c7d2de", background=BG)
+        style.map("Review.Treeview.Heading", background=[("active", _mix(review_heading, accent, 0.18))])
+        style.configure("ReviewPanel.TLabel", foreground=text, background=bg)
+        style.configure("ReviewMuted.TLabel", foreground=muted, background=bg)
+
+        try:
+            self.configure(bg=bg)
+        except Exception:
+            pass
+        if hasattr(self, "form_canvas"):
+            self.form_canvas.configure(background=bg)
+        if hasattr(self, "script"):
+            self.script.configure(background=field, foreground=text, insertbackground=text,
+                                  selectbackground=select_bg, selectforeground=select_fg)
+        if hasattr(self, "log_box"):
+            self.log_box.configure(bg=bg, fg=muted, insertbackground=text,
+                                   selectbackground=select_bg, selectforeground=select_fg)
+        if getattr(self, "review_popup", None) is not None:
+            try:
+                if self.review_popup.winfo_exists():
+                    self.review_popup.configure(bg=bg)
+            except Exception:
+                pass
 
     def var(self, name, default=""):
         value = tk.StringVar(value=default)
@@ -163,6 +249,10 @@ class FactoryApp(tk.Tk):
         return btn
 
     def _build(self):
+        # Project-specific overlay header. Keep it available even if the user never
+        # opens Advanced Settings so save/load round-trips it reliably.
+        self.var("header_text", "VIDEO / REPORT")
+        self.var("theme_id", DEFAULT_THEME)
         outer = ttk.Frame(self, padding=18)
         outer.pack(fill="both", expand=True)
         # Reserve the action bar FIRST, so tall content cannot push it outside
@@ -196,10 +286,17 @@ class FactoryApp(tk.Tk):
         ttk.Label(source, text="録画").grid(row=0, column=0, padx=(0, 12), sticky="w")
         ttk.Entry(source, textvariable=self.var("video")).grid(row=0, column=1, sticky="ew")
         self.button(source, "ファイルを選択", self._video).grid(row=0, column=2, padx=(10, 0))
-        ttk.Label(source, text="タイトル").grid(row=1, column=0, padx=(0, 12), sticky="w", pady=(8, 0))
-        ttk.Entry(source, textvariable=self.var("title", "MONTAZH")).grid(row=1, column=1, columnspan=2, sticky="ew", pady=(8, 0))
-        ttk.Label(source, text="例: PMN-001 TERMINUS 終末時限装置 → PMN-001 / TERMINUS ＋ 終末時限装置 として配置",
-                  style="Muted.TLabel").grid(row=2, column=1, columnspan=2, sticky="w", pady=(4, 0))
+        ttk.Label(source, text="ヘッダー").grid(row=1, column=0, padx=(0, 12), sticky="w", pady=(8, 0))
+        ttk.Entry(source, textvariable=self.vars["header_text"]).grid(row=1, column=1, columnspan=2, sticky="ew", pady=(8, 0))
+        ttk.Label(source, text="空欄なら非表示", style="Muted.TLabel").grid(row=2, column=1, columnspan=2, sticky="w", pady=(3, 0))
+        ttk.Label(source, text="タイトル").grid(row=3, column=0, padx=(0, 12), sticky="w", pady=(8, 0))
+        ttk.Entry(source, textvariable=self.var("title", "サンプル動画")).grid(row=3, column=1, columnspan=2, sticky="ew", pady=(8, 0))
+        ttk.Label(source, text="自由入力。例: AX-12 CLEANER 重複整理装置 → AX-12 / CLEANER ＋ 重複整理装置として配置",
+                  style="Muted.TLabel").grid(row=4, column=1, columnspan=2, sticky="w", pady=(4, 0))
+        ttk.Label(source, text="テーマ").grid(row=5, column=0, padx=(0, 12), sticky="w", pady=(8, 0))
+        self.theme_choice = ttk.Combobox(source, textvariable=self.vars["theme_id"], values=list(THEMES), state="readonly", width=24)
+        self.theme_choice.grid(row=5, column=1, sticky="w", pady=(8, 0))
+        ttk.Label(source, text="背景・文字・アクセント色を5種類から選択", style="Muted.TLabel").grid(row=6, column=1, columnspan=2, sticky="w", pady=(3, 0))
         middle = ttk.Frame(shell)
         middle.pack(fill="both", expand=True)
         middle.columnconfigure(0, weight=1)
@@ -250,8 +347,18 @@ class FactoryApp(tk.Tk):
         ttk.Spinbox(rate, from_=0, to=2., increment=.05, width=5, textvariable=self.var("gap", "0.20")).pack(side="left", padx=7)
         self.audition_button = self.button(right, "最初のセリフを試聴", self._audition)
         self.audition_button.pack(fill="x", pady=(0, 12))
+        ttk.Label(right, text="書き出し用途").pack(anchor="w")
+        self.output_mode_choice = ttk.Combobox(
+            right, values=list(OUTPUT_MODES), state="readonly",
+            textvariable=self.var("output_mode", SHORT_MODE))
+        self.output_mode_choice.pack(fill="x", pady=(5, 8))
+        self.output_mode_choice.bind("<<ComboboxSelected>>", self._output_mode_changed)
         ttk.Label(right, text="出力サイズ").pack(anchor="w")
-        ttk.Combobox(right, values=list(PRESETS), state="readonly", textvariable=self.var("preset", next(iter(PRESETS)))).pack(fill="x", pady=(5, 10))
+        self.preset_choice = ttk.Combobox(
+            right, values=list(SHORT_PRESETS), state="readonly",
+            textvariable=self.var("preset", SHORT_PRESETS[0]))
+        self.preset_choice.pack(fill="x", pady=(5, 10))
+        self._output_mode_changed()
         ttk.Label(right, text="保存先（初期値は本体フォルダ内 output / 変更可）").pack(anchor="w")
         ttk.Entry(right, textvariable=self.var("output_dir", str(default_output_root()))).pack(fill="x", pady=5)
         output_actions = ttk.Frame(right)
@@ -382,8 +489,10 @@ class FactoryApp(tk.Tk):
         for name, var in self.vars.items():
             if name != "engine_url":
                 var.set(getattr(settings, name))
+        self._output_mode_changed()
         self._source_audio_volume_changed(self.vars["source_audio_volume"].get())
         self._source_audio_changed()
+        self._apply_ui_theme()
         self.script.delete("1.0", "end")
         self.script.insert("1.0", settings.script)
         self.review_states = list(settings.review_states or [])
@@ -408,8 +517,9 @@ class FactoryApp(tk.Tk):
                 return
             self.vars["output_dir"].set(str(folders["root"]))
             self.status.set(f"作業フォルダ: {folders['root']}")
+            self._save_user_settings()
             try:
-                save_project(ROOT / "last_project.json", self._settings())
+                save_project(self._last_project_path(), self._settings())
             except Exception:
                 # The normal close/render paths save the same state again. A preference
                 # write failure here must not block the user from choosing a folder.
@@ -429,6 +539,22 @@ class FactoryApp(tk.Tk):
         except (tk.TclError, ValueError, TypeError):
             number = 20.0
         self.source_audio_value.set(f"{round(number):d}%")
+
+
+    def _output_mode_changed(self, _event=None):
+        mode = self.vars.get("output_mode").get() if "output_mode" in self.vars else SHORT_MODE
+        if mode == NORMAL_MODE:
+            values = list(NORMAL_PRESETS)
+        else:
+            values = list(SHORT_PRESETS)
+            mode = SHORT_MODE
+            if "output_mode" in self.vars:
+                self.vars["output_mode"].set(mode)
+        if hasattr(self, "preset_choice"):
+            self.preset_choice.configure(values=values)
+        current = self.vars.get("preset").get() if "preset" in self.vars else ""
+        if current not in values and "preset" in self.vars:
+            self.vars["preset"].set(values[0])
 
     def _source_audio_changed(self):
         state = "normal" if self.vars["source_audio_enabled"].get() else "disabled"
@@ -483,28 +609,62 @@ class FactoryApp(tk.Tk):
             self.script.insert("1.0", content)
 
     def _save(self):
-        path = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("PMN-003プロジェクト", "*.json")])
+        initial = re.sub(r'[^A-Za-z0-9_-]+', '_', self.vars["title"].get().strip()).strip('_') or "MONTAZH"
+        path = filedialog.asksaveasfilename(
+            title="MONTAZHプロジェクトを保存", defaultextension=".montazh",
+            initialfile=f"{initial}.montazh",
+            filetypes=[("MONTAZHプロジェクト", "*.montazh"), ("旧形式JSON", "*.json")])
         if path:
+            if self.busy:
+                return
+            self.busy = True; self.busy_state = "SAVING"
+            self.status.set("プロジェクト保存中…")
+            self.update_idletasks()
             try:
-                save_project(Path(path), self._settings())
-                self.status.set("プロジェクトを保存しました。")
+                target = Path(path)
+                save_project(target, self._settings())
+                self.current_project = target
+                self.status.set(f"保存しました: {target.name}")
+                self._write_app_log(f"operation=SAVE result=success path={target}")
             except Exception as exc:
+                self._write_app_log(f"operation=SAVE result=failure path={path} error={exc}")
                 self._error(exc)
+            finally:
+                self.busy = False; self.busy_state = "IDLE"
 
     def _load(self):
-        path = filedialog.askopenfilename(filetypes=[("PMN-003プロジェクト", "*.json")])
+        path = filedialog.askopenfilename(
+            title="MONTAZHプロジェクトを開く",
+            filetypes=[("MONTAZHプロジェクト", "*.montazh *.json"), ("全ファイル", "*.*")])
         if path:
-            if not messagebox.askyesno("プロジェクトを開く", "現在の画面の内容を読み込んだ設定に置き換えますか？\n未保存の台本は先に保存してください。"):
+            if not messagebox.askyesno("プロジェクトを開く",
+                    "現在の画面を保存済みプロジェクトに置き換えますか？\n"
+                    "台本・時間配置・音声キャッシュをまとめて復元します。"):
                 return
+            if self.busy:
+                return
+            self.busy = True; self.busy_state = "LOADING"
+            self.status.set("プロジェクト読込中…")
+            self.update_idletasks()
             try:
-                self._apply(load_project(Path(path)))
-                self.status.set("読み込み完了。VOICEVOXの声を自動確認します。")
+                target = Path(path)
+                loaded = load_project(target)  # Work state; UI is untouched until this succeeds.
+                self._apply(loaded)
+                self.current_project = target
+                self.status.set("プロジェクトを復元しました。VOICEVOXを自動確認します。")
+                self._write_app_log(f"operation=LOAD result=success path={target}")
                 self.after(50, self._autoload_voices)
             except Exception as exc:
+                self._write_app_log(f"operation=LOAD result=failure path={path} error={exc}")
                 self._error(exc)
+            finally:
+                self.busy = False; self.busy_state = "IDLE"
 
     def _load_last(self):
-        path = ROOT / "last_project.json"
+        path = self._last_project_path()
+        legacy = ROOT / "last_project.json"
+        if not path.is_file() and legacy.is_file():
+            path = legacy
         if path.is_file():
             try:
                 settings = load_project(path)
@@ -530,22 +690,37 @@ class FactoryApp(tk.Tk):
             "細かく指定したい場合だけTXT記法を使えます。\n"
             "時間指定: [00:08-00:14] の次の行にセリフ\n"
             "読みだけ変更: 字幕 || 読み上げ文\n\n"
-            "完成時には、使った台本を script.txt として出力フォルダにも自動保存します。")
+            "『保存』は .montazh 1ファイルに台本・時間配置・再利用できる音声をまとめます。\n"
+            "TXT保存は台本文だけを書き出したい場合の補助機能です。")
 
     def _advanced(self):
         popup = tk.Toplevel(self)
         popup.title("詳細設定")
-        popup.configure(bg=BG)
+        popup.configure(bg=self._current_theme_colors()["bg"])
         popup.transient(self)
         frame = ttk.Frame(popup, padding=20)
         frame.pack(fill="both", expand=True)
+        # VOICEVOX folder is a machine-local preference, not project data.
+        ttk.Label(frame, text="VOICEVOX / Nemo フォルダ（自動起動したい場合だけ指定）").grid(row=0, column=0, sticky="w", pady=(10, 4))
+        ttk.Entry(frame, textvariable=self.voicevox_dir_path, width=65).grid(row=1, column=0)
+        def choose_voicevox():
+            value = filedialog.askdirectory(
+                parent=popup, title="VOICEVOX / Nemo が入っているフォルダを選択")
+            if value:
+                # Selecting a folder only saves the preference. It must never launch VOICEVOX here.
+                self.voicevox_dir_path.set(value)
+                self._save_user_settings()
+                self._voicevox_start_attempted.clear()
+        ttk.Button(frame, text="選択", command=choose_voicevox).grid(row=1, column=1, padx=8)
+
         fields = (("VOICEVOX接続先（このPC内のみ）", "engine_url"),
                   ("日本語フォント（空欄なら自動）", "font_path"),
                   ("FFmpeg実行ファイル（空欄なら自動）", "ffmpeg_path"),
                   ("動画右上のアイコン（空欄なら非表示）", "logo_path"))
-        for row, (label, name) in enumerate(fields):
-            ttk.Label(frame, text=label).grid(row=row * 2, column=0, sticky="w", pady=(10, 4))
-            ttk.Entry(frame, textvariable=self.vars[name], width=65).grid(row=row * 2 + 1, column=0)
+        for offset, (label, name) in enumerate(fields, start=1):
+            row = offset * 2
+            ttk.Label(frame, text=label).grid(row=row, column=0, sticky="w", pady=(10, 4))
+            ttk.Entry(frame, textvariable=self.vars[name], width=65).grid(row=row + 1, column=0)
             if name != "engine_url":
                 def choose(key=name):
                     if key == "logo_path":
@@ -556,23 +731,236 @@ class FactoryApp(tk.Tk):
                         value = filedialog.askopenfilename(parent=popup)
                     if value:
                         self.vars[key].set(value)
-                ttk.Button(frame, text="選択", command=choose).grid(row=row * 2 + 1, column=1, padx=8)
-        ttk.Label(frame, text="縦動画では右上、横動画では右下にアイコンを常時表示します。読み込むプロジェクト内のFFmpegパスは安全のため無視されます。",
-                  style="Muted.TLabel", wraplength=520).grid(row=8, column=0, columnspan=2, sticky="w", pady=15)
-        ttk.Button(frame, text="閉じる", command=popup.destroy).grid(row=9, column=0, sticky="e")
+                ttk.Button(frame, text="選択", command=choose).grid(row=row + 1, column=1, padx=8)
+        info_row = (len(fields) + 1) * 2
+        ttk.Label(frame, text="VOICEVOXのフォルダ指定はこのPCだけに保存し、プロジェクトファイルには含めません。ヘッダー・テーマ・タイトルは『録画とタイトル』で編集し、プロジェクトごとに保存されます。",
+                  style="Muted.TLabel", wraplength=560).grid(row=info_row, column=0, columnspan=2, sticky="w", pady=15)
+        def close_advanced():
+            self._save_user_settings()
+            popup.destroy()
+        ttk.Button(frame, text="閉じる", command=close_advanced).grid(row=info_row + 1, column=0, sticky="e")
+        popup.protocol("WM_DELETE_WINDOW", close_advanced)
         popup.grab_set()
 
-    def _start(self, operation):
+    def _local_state_root(self) -> Path:
+        if os.name == "nt":
+            base = Path(os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local")))
+        elif sys.platform == "darwin":
+            base = Path.home() / "Library" / "Application Support"
+        else:
+            base = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config")))
+        root = base / "Promnica" / "PMN-003-MONTAZH"
+        root.mkdir(parents=True, exist_ok=True)
+        return root
+
+    def _last_project_path(self) -> Path:
+        return self._local_state_root() / "last_project.json"
+
+    @staticmethod
+    def _atomic_write_json(path: Path, data: dict) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, name = tempfile.mkstemp(prefix=path.stem + "_", suffix=".tmp", dir=path.parent)
+        tmp = Path(name)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(data, handle, ensure_ascii=False, indent=2)
+                handle.flush(); os.fsync(handle.fileno())
+            json.loads(tmp.read_text(encoding="utf-8"))
+            os.replace(tmp, path)
+        finally:
+            if tmp.exists():
+                tmp.unlink()
+
+    def _user_settings_path(self) -> Path:
+        return self._local_state_root() / "settings.json"
+
+    def _load_user_settings(self):
+        path = self._user_settings_path()
+        legacy = ROOT / "user_settings.json"
+        source = path if path.is_file() else legacy if legacy.is_file() else None
+        if source is None:
+            return
+        try:
+            data = json.loads(source.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                raise ValueError("設定ファイルがオブジェクトではありません")
+            schema = data.get("schema_version")
+            if schema is None:
+                # Known v0.3.x local settings shape. Keep the old file untouched and migrate in memory.
+                value = data.get("voicevox_dir_path", "")
+                if not value:
+                    old_exe = data.get("voicevox_exe_path", "")
+                    if isinstance(old_exe, str) and old_exe.strip():
+                        old_path = Path(old_exe).expanduser()
+                        value = str(old_path.parent) if old_path.suffix.lower() == ".exe" else old_exe
+                migrated = {
+                    "schema_version": USER_SETTINGS_SCHEMA_VERSION,
+                    "voicevox_dir_path": value if isinstance(value, str) else "",
+                    "default_output_dir": data.get("default_output_dir", "") if isinstance(data.get("default_output_dir", ""), str) else "",
+                    "default_source_audio_volume": float(data.get("default_source_audio_volume", 20.0)),
+                    "window_geometry": data.get("window_geometry", "") if isinstance(data.get("window_geometry", ""), str) else "",
+                }
+                data = migrated
+            elif schema != USER_SETTINGS_SCHEMA_VERSION:
+                self._user_settings_writable = False
+                raise FactoryError(f"未対応の共通設定schema_versionです: {schema}")
+            expected = {"schema_version", "voicevox_dir_path", "default_output_dir",
+                        "default_source_audio_volume", "window_geometry"}
+            if set(data) != expected:
+                self._user_settings_writable = False
+                raise FactoryError("共通設定の項目構成が一致しません。旧設定は変更しません。")
+            self.voicevox_dir_path.set(str(data["voicevox_dir_path"]))
+            if data["default_output_dir"]:
+                self.vars["output_dir"].set(str(data["default_output_dir"]))
+            try:
+                volume = float(data["default_source_audio_volume"])
+                if 0 <= volume <= 100:
+                    self.vars["source_audio_volume"].set(volume)
+            except (TypeError, ValueError):
+                pass
+            geometry = str(data["window_geometry"]).strip()
+            if geometry:
+                try:
+                    self.geometry(geometry)
+                except tk.TclError:
+                    pass
+        except Exception as exc:
+            self._write_app_log(f"user settings load failed path={source}: {exc}")
+            self.status.set("共通設定を読み込めませんでした。旧設定は変更せず既定値で起動します。")
+            self.after(300, lambda: messagebox.showwarning(
+                "共通設定", "共通設定を読み込めませんでした。旧設定ファイルは変更していません。\n" + str(exc)))
+
+    def _save_user_settings(self):
+        if not self._user_settings_writable:
+            return
+        try:
+            data = {
+                "schema_version": USER_SETTINGS_SCHEMA_VERSION,
+                "voicevox_dir_path": self.voicevox_dir_path.get().strip(),
+                "default_output_dir": self.vars["output_dir"].get().strip(),
+                "default_source_audio_volume": float(self.vars["source_audio_volume"].get()),
+                "window_geometry": self.geometry(),
+            }
+            self._atomic_write_json(self._user_settings_path(), data)
+        except Exception as exc:
+            self._write_app_log(f"user settings save failed: {exc}")
+
+    def _write_app_log(self, message: str):
+        try:
+            folders = ensure_output_folders(self.vars.get("output_dir").get() if self.vars.get("output_dir") else "")
+            path = folders["logs"] / "app.log"
+            stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(f"[{stamp}] {message.rstrip()}\n")
+        except Exception:
+            pass
+
+    def report_callback_exception(self, exc, val, tb):
+        detail = "".join(traceback.format_exception(exc, val, tb))
+        self._write_app_log("Tk callback exception:\n" + detail)
+        self.status.set("画面処理でエラーが発生しました。output/logs/app.log を確認してください。")
+        try:
+            messagebox.showerror("PMN-003", f"画面処理でエラーが発生しました。\n\n{val}\n\nログ: output/logs/app.log")
+        except Exception:
+            pass
+
+    def _voicevox_candidates(self, url: str) -> list[Path]:
+        """Resolve executable candidates only inside the user-selected folder.
+
+        Deliberately no drive/Program Files/PATH auto-search: automatic startup is opt-in.
+        """
+        if os.name != "nt":
+            return []
+        configured = self.voicevox_dir_path.get().strip()
+        if not configured:
+            return []
+        folder = Path(configured).expanduser()
+        if not folder.is_dir():
+            self._write_app_log(f"configured VOICEVOX folder not found: {folder}")
+            return []
+        port = url.rsplit(":", 1)[-1]
+        names = (["VOICEVOX NEMO.exe", "VOICEVOX Nemo.exe", "VOICEVOX.exe"]
+                 if port == "50121" else ["VOICEVOX.exe", "VOICEVOX NEMO.exe", "VOICEVOX Nemo.exe"])
+        candidates: list[Path] = []
+        # Prefer the selected directory itself, then common immediate subfolders.
+        search_dirs = [folder, folder / "VOICEVOX", folder / "VOICEVOX NEMO", folder / "VOICEVOX Nemo"]
+        for root in search_dirs:
+            if not root.is_dir():
+                continue
+            for name in names:
+                candidate = root / name
+                if candidate.is_file():
+                    candidates.append(candidate)
+        # Some portable packages put the launcher one or two folders below the selected root.
+        if not candidates:
+            try:
+                for candidate in folder.glob("*/*.exe"):
+                    if candidate.name.lower() in {n.lower() for n in names}:
+                        candidates.append(candidate)
+                for candidate in folder.glob("*/*/*.exe"):
+                    if candidate.name.lower() in {n.lower() for n in names}:
+                        candidates.append(candidate)
+            except OSError:
+                pass
+        seen = set(); result = []
+        for candidate in candidates:
+            try:
+                resolved = candidate.resolve()
+            except OSError:
+                continue
+            key = str(resolved).lower()
+            if key not in seen and resolved.is_file():
+                seen.add(key); result.append(resolved)
+        return result
+
+    def _start_voicevox_in_background(self, url: str):
+        if url in self._voicevox_start_attempted:
+            return
+        self._voicevox_start_attempted.add(url)
+        candidates = self._voicevox_candidates(url)
+        if not candidates:
+            self.events.put(("voice_auto_not_found", None))
+            return
+        exe = candidates[0]
+        try:
+            kwargs = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+            if os.name == "nt":
+                startup = subprocess.STARTUPINFO()
+                startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                startup.wShowWindow = 6  # SW_MINIMIZE
+                kwargs["startupinfo"] = startup
+                kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            self._voicevox_process = subprocess.Popen([str(exe)], **kwargs)
+            self._write_app_log(f"VOICEVOX auto-start: {exe}")
+        except OSError as exc:
+            self.events.put(("voice_auto_not_found", str(exc)))
+            return
+        # Wait for the local API without blocking Tk.
+        for _ in range(40):
+            if self.stop.is_set():
+                return
+            try:
+                voices = Voicevox(url).speakers()
+                self.events.put(("speakers_auto", (url, voices)))
+                self.events.put(("status", "VOICEVOXを裏で起動し、声を読み込みました。"))
+                return
+            except Exception:
+                time.sleep(.75)
+        self.events.put(("voice_auto_not_found", "VOICEVOXを起動しましたがAPIの準備を確認できませんでした。"))
+
+    def _start(self, operation, state="GENERATING"):
         if self.busy:
             return
         self.busy = True
+        self.busy_state = state
         self.stop.clear()
         self.engine_choice.configure(state="disabled")
         self.progress["value"] = 0
         for button in self.controls:
             button.configure(state="disabled")
         self.cancel_button.configure(state="normal")
-        self.status.set("処理中…")
+        self.status.set(f"処理中: {state}")
+        target_snapshot = self.vars.get("video").get() if self.vars.get("video") else ""
         def worker():
             try:
                 operation()
@@ -580,6 +968,7 @@ class FactoryApp(tk.Tk):
                 self.events.put(("log", str(exc)))
                 self.events.put(("status", str(exc)))
             except Exception as exc:
+                self._write_app_log(f"operation={state} result=failure target={target_snapshot} error={exc}\n" + traceback.format_exc())
                 self.events.put(("error", str(exc)))
             finally:
                 self.events.put(("idle", None))
@@ -597,8 +986,10 @@ class FactoryApp(tk.Tk):
                 voices = Voicevox(url).speakers()
                 self.events.put(("speakers_auto", (url, voices)))
             except Exception as exc:
-                # VOICEVOX may simply not be running yet. This is not a startup error.
+                # Automatic launch is opt-in: only try it when the user configured a folder.
                 self.events.put(("voice_auto_unavailable", str(exc)))
+                if self.voicevox_dir_path.get().strip():
+                    self._start_voicevox_in_background(url)
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -655,7 +1046,7 @@ class FactoryApp(tk.Tk):
         popup.title(f"配置を確認・修正 / MONTAZH v{VERSION}")
         self._fit_popup_to_screen(popup)
         popup.minsize(1100, 720)
-        popup.configure(bg=BG)
+        popup.configure(bg=self._current_theme_colors()["bg"])
         popup.transient(self)
 
         outer = ttk.Frame(popup, padding=14)
@@ -670,7 +1061,7 @@ class FactoryApp(tk.Tk):
         top.columnconfigure(1, weight=0, minsize=300)
         top.rowconfigure(0, weight=1)
 
-        preview = VideoPreview(top, BG)
+        preview = VideoPreview(top, self._current_theme_colors()["bg"])
         preview.grid(row=0, column=0, sticky="nsew", padx=(0, 14))
 
         side = ttk.LabelFrame(top, text="選択中のセリフ", padding=12)
@@ -685,7 +1076,7 @@ class FactoryApp(tk.Tk):
         start_var = tk.StringVar()
         end_var = tk.StringVar()
         length_var = tk.StringVar()
-        warning_var = tk.StringVar(value="場面解析中…")
+        warning_var = tk.StringVar(value="配置画面を開きました。音声をキャッシュ確認中…")
 
         ttk.Label(side, text="読み上げ開始秒（Enterで反映）", style="ReviewPanel.TLabel").pack(anchor="w")
         start_entry = ttk.Entry(side, textvariable=start_var, width=18)
@@ -796,7 +1187,9 @@ class FactoryApp(tk.Tk):
         timeline_box.pack(fill="x", pady=(12, 0))
         timeline = TimelineEditor(timeline_box, on_select=on_timeline_select,
                                   on_change=on_timeline_change, on_seek=lambda t: preview.seek_to(t),
-                                  bg=BG, bar=ACCENT, selected="#a1efd9")
+                                  bg=self._current_theme_colors()["bg"],
+                                  bar=self._current_theme_colors()["accent"],
+                                  selected=_mix(self._current_theme_colors()["accent"], self._current_theme_colors()["text"], 0.25))
         preview.on_position_change = timeline.set_playhead
         timeline.pack(fill="both", expand=True)
         ttk.Label(timeline_box,
@@ -894,9 +1287,15 @@ class FactoryApp(tk.Tk):
                     return
                 self.script.delete("1.0", "end")
                 self.script.insert("1.0", updated_script)
-            self.review_states = [{"caption": r["caption"], "speech": r["speech"], "start": r["start"],
-                "audio_duration": r["audio_duration"], "reason": r.get("reason", ""),
-                "video_id": state["video_id"]} for r in state["rows"]]
+            self.review_states = [{"caption": r["caption"], "speech": r["speech"], "script_index": n,
+                "start": r["start"], "audio_duration": r["audio_duration"], "reason": r.get("reason", ""),
+                "video_id": state["video_id"]} for n, r in enumerate(state["rows"])]
+            # If the user already chose a project file, keep timeline edits persisted automatically.
+            if self.current_project is not None:
+                try:
+                    save_project(self.current_project, self._settings())
+                except Exception as exc:
+                    self._write_app_log("project autosave failed: " + repr(exc))
             if deleted:
                 self.status.set(f"配置を保存し、{len(deleted)}セリフを台本から削除しました。")
             else:
@@ -911,16 +1310,25 @@ class FactoryApp(tk.Tk):
         popup.protocol("WM_DELETE_WINDOW", lambda: (preview.close(), popup.destroy()))
 
         def run():
+            def review_log(msg):
+                self.events.put(("log", msg))
+                self.events.put(("review_loading_status", (popup, warning_var, msg)))
             clips, warnings, video_id, audio_blobs = build_review_plan(settings,
-                lambda msg: self.events.put(("log", msg)), self.stop,
-                lambda value: self.events.put(("progress", value)))
+                review_log, self.stop, lambda value: self.events.put(("progress", value)))
             rows = []
+            prior_by_index = {r.get("script_index"): r for r in (self.review_states or [])
+                              if isinstance(r, dict) and r.get("video_id") == video_id
+                              and isinstance(r.get("script_index"), int)}
             prior = {r.get("caption"): r for r in (self.review_states or [])
                      if isinstance(r, dict) and r.get("video_id") == video_id}
             from engine import find_ffmpeg, probe_duration
             source_duration = probe_duration(find_ffmpeg(settings.ffmpeg_path), Path(settings.video).resolve(), self.stop)
             for script_index, clip in enumerate(clips):
-                saved = prior.get(clip.scene.caption, {})
+                saved = prior_by_index.get(script_index)
+                if saved and (saved.get("caption") != clip.scene.caption or saved.get("speech") != clip.scene.speech):
+                    saved = None
+                if not saved:
+                    saved = prior.get(clip.scene.caption, {})
                 rows.append({"caption": clip.scene.caption, "speech": clip.scene.speech,
                     "start": clip.start, "audio_duration": clip.audio_duration,
                     "reason": saved.get("reason", getattr(clip, "reason", "")),
@@ -928,7 +1336,7 @@ class FactoryApp(tk.Tk):
             self.events.put(("review_plan_v019", (popup, preview, timeline, state, rows, warnings,
                                                    warning_var, update_detail, refresh_warning, rebuild_narration_preview,
                                                    source_duration, video_id, settings.video, audio_blobs)))
-        self._start(run)
+        self._start(run, "GENERATING")
 
     def _accept_review_plan_v019(self, payload):
         (popup, preview, timeline, state, rows, warnings, warning_var, update_detail,
@@ -988,14 +1396,14 @@ class FactoryApp(tk.Tk):
         if not messagebox.askyesno("MP4の製造", message):
             return
         try:
-            save_project(ROOT / "last_project.json", settings)
+            save_project(self._last_project_path(), settings)
         except OSError:
             pass
         def run():
             path = render(settings, lambda msg: self.events.put(("log", msg)), self.stop,
                           lambda value: self.events.put(("progress", value)))
             self.events.put(("complete", path))
-        self._start(run)
+        self._start(run, "EXPORTING")
 
     def _cancel(self):
         self.stop.set()
@@ -1007,6 +1415,7 @@ class FactoryApp(tk.Tk):
                 kind, value = self.events.get_nowait()
                 if kind == "idle":
                     self.busy = False
+                    self.busy_state = "IDLE"
                     self.audition_active = False
                     for button in self.controls:
                         button.configure(state="normal")
@@ -1032,11 +1441,21 @@ class FactoryApp(tk.Tk):
                 elif kind == "speakers_auto":
                     self._accept_speakers(*value)
                 elif kind == "voice_auto_unavailable":
-                    # Silent fallback: do not interrupt startup with a modal dialog.
-                    self.status.set(f"VOICEVOXを起動すると {DEFAULT_SPEAKER_LABEL} を自動選択します。")
+                    self.status.set("VOICEVOXが未起動です。自動起動する場合は詳細設定でフォルダを指定してください。")
+                elif kind == "voice_auto_not_found":
+                    self.status.set("指定したVOICEVOXフォルダから起動できませんでした。設定を確認するか手動起動してください。")
+                    if value:
+                        self._write_app_log("VOICEVOX auto-start: " + str(value))
                 elif kind == "preview":
                     self._show_preview(value)
                     self.status.set("最初のセリフのレイアウトを表示しました。")
+                elif kind == "review_loading_status":
+                    popup, warning_var, text = value
+                    try:
+                        if popup.winfo_exists():
+                            warning_var.set(text)
+                    except tk.TclError:
+                        pass
                 elif kind == "review_plan_v019":
                     self._accept_review_plan_v019(value)
                 elif kind == "complete":
@@ -1064,12 +1483,12 @@ class FactoryApp(tk.Tk):
     def _show_preview(self, path):
         popup = tk.Toplevel(self)
         popup.title("完成レイアウトのプレビュー / 最初のセリフ")
-        popup.configure(bg=BG)
+        popup.configure(bg=self._current_theme_colors()["bg"])
         with Image.open(path) as original:
             im = original.copy()
         im.thumbnail((int(self.winfo_screenwidth() * .70), int(self.winfo_screenheight() * .78)))
         photo = ImageTk.PhotoImage(im, master=popup)
-        label = tk.Label(popup, image=photo, bg=BG)
+        label = tk.Label(popup, image=photo, bg=self._current_theme_colors()["bg"])
         label.image = photo
         label.pack(padx=10, pady=10)
 
@@ -1081,6 +1500,7 @@ class FactoryApp(tk.Tk):
                 self._error(exc)
 
     def _error(self, exc):
+        self._write_app_log("error: " + str(exc))
         self.status.set("停止しました。入力とエラー内容を確認してください。")
         messagebox.showerror("PMN-003", str(exc))
 
@@ -1091,13 +1511,15 @@ class FactoryApp(tk.Tk):
                 self.stop.set()
                 self.status.set("試聴を止めて終了します。音声準備中は、その応答を待ちます。")
                 return
-            if messagebox.askyesno("処理中です", "中止を要求しますか？\n安全に停止した後、もう一度閉じてください。"):
+            if messagebox.askyesno("処理中です", "処理を安全に停止してMONTAZHを終了しますか？"):
+                self.close_after_idle = True
                 self._cancel()
             return
         try:
-            save_project(ROOT / "last_project.json", self._settings())
+            save_project(self._last_project_path(), self._settings())
         except Exception:
             pass
+        self._save_user_settings()
         self.preview_directory.cleanup()
         self.destroy()
 

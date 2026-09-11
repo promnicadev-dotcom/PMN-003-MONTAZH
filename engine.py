@@ -3,6 +3,9 @@ from __future__ import annotations
 
 import io
 import json
+import http.client
+import socket
+import hashlib
 import math
 import os
 import re
@@ -16,13 +19,20 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import wave
+import zipfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable
 
 from PIL import Image, ImageDraw, ImageFont
 
-VERSION = "0.2.10"
+VERSION = "0.3.8"
+PROJECT_SCHEMA_VERSION = 3
+USER_SETTINGS_SCHEMA_VERSION = 1
+VOICEVOX_CONNECT_TIMEOUT = 5.0
+VOICEVOX_READ_TIMEOUT = 20.0
+VOICEVOX_SYNTHESIS_READ_TIMEOUT = 180.0
+FFMPEG_STALL_TIMEOUT = 90.0
 OVERLAP_TOLERANCE = 0.05
 # In a PyInstaller build, source modules live under the bundled runtime directory.
 # User-facing state/output must instead live next to the executable.
@@ -36,10 +46,27 @@ ENGINE_PRESETS = {NEMO_ENGINE: "http://127.0.0.1:50121",
                   STANDARD_ENGINE: "http://127.0.0.1:50021"}
 DEFAULT_ENGINE_URL = ENGINE_PRESETS[NEMO_ENGINE]
 DEFAULT_SPEAKER_LABEL = "女声2 / ノーマル"
+SHORT_MODE = "ショート動画（9:16）"
+NORMAL_MODE = "通常動画（16:9）"
+OUTPUT_MODES = (SHORT_MODE, NORMAL_MODE)
+SHORT_PRESETS = ("縦・本番 1080×1920", "縦・試作 720×1280")
+NORMAL_PRESETS = ("横 1920×1080",)
 PRESETS = {"縦・本番 1080×1920": (1080, 1920), "縦・試作 720×1280": (720, 1280),
            "横 1920×1080": (1920, 1080)}
 BG = "#101722"
 ACCENT = "#72dec2"
+
+THEMES = {
+    "研究所ダーク": {"bg": "#101722", "text": "#f4f7fa", "accent": "#72dec2", "muted": "#93a0ad"},
+    "モノクロ": {"bg": "#111111", "text": "#f5f5f5", "accent": "#a7a7a7", "muted": "#8a8a8a"},
+    "ライト": {"bg": "#f4f5f7", "text": "#171a1f", "accent": "#475569", "muted": "#6b7280"},
+    "ネイビー": {"bg": "#0b1730", "text": "#f4f8ff", "accent": "#69b7ff", "muted": "#92a6c2"},
+    "ウォーム": {"bg": "#241915", "text": "#fff4df", "accent": "#e9a15b", "muted": "#c3a78f"},
+}
+DEFAULT_THEME = "研究所ダーク"
+
+def theme_colors(settings) -> dict[str, str]:
+    return THEMES.get(getattr(settings, "theme_id", DEFAULT_THEME), THEMES[DEFAULT_THEME])
 
 
 class FactoryError(Exception):
@@ -62,8 +89,11 @@ class Scene:
 class Settings:
     video: str = ""
     script: str = ""
-    title: str = "動画自動製造機"
+    title: str = "サンプル動画"
+    header_text: str = "VIDEO / REPORT"
+    theme_id: str = DEFAULT_THEME
     output_dir: str = ""
+    output_mode: str = SHORT_MODE
     preset: str = "縦・本番 1080×1920"
     speaker_id: int = -1
     speaker_label: str = DEFAULT_SPEAKER_LABEL
@@ -78,17 +108,24 @@ class Settings:
     review_states: list[dict] | None = None
 
     @classmethod
-    def from_dict(cls, data: dict) -> Settings:
+    def from_dict(cls, data: dict, *, strict: bool = False) -> Settings:
         if not isinstance(data, dict):
             raise FactoryError("プロジェクトの形式が正しくありません。")
-        unknown = set(data) - set(cls.__dataclass_fields__)
+        expected = set(cls.__dataclass_fields__)
+        unknown = set(data) - expected
         if unknown:
-            raise FactoryError("このバージョンでは読めない設定があります: " + ", ".join(unknown))
+            raise FactoryError("このバージョンでは読めない設定があります: " + ", ".join(sorted(unknown)))
+        if strict:
+            missing = expected - set(data)
+            if missing:
+                raise FactoryError("プロジェクトに必要な設定が不足しています: " + ", ".join(sorted(missing)))
         obj = cls(**data)
-        for name in ("video", "script", "title", "output_dir", "preset", "speaker_label",
+        for name in ("video", "script", "title", "header_text", "theme_id", "output_dir", "output_mode", "preset", "speaker_label",
                      "font_path", "engine_url", "ffmpeg_path", "logo_path"):
             if not isinstance(getattr(obj, name), str):
                 raise FactoryError(f"設定 {name} は文字列で指定してください。")
+        if obj.theme_id not in THEMES:
+            raise FactoryError(f"未対応のテーマです: {obj.theme_id}")
         if obj.review_states is not None and not isinstance(obj.review_states, list):
             raise FactoryError("配置確認データの形式が正しくありません。")
         return obj
@@ -240,10 +277,8 @@ def _even_starts(lengths: list[float], source_duration: float, gap: float) -> li
 
 
 def video_identity(path: str | Path) -> str:
-    """Cheap identity used only to invalidate placements after the source video changes."""
-    p = Path(path).resolve()
-    st = p.stat()
-    return f"{p}|{st.st_size}|{st.st_mtime_ns}"
+    """Logical material identity: same resolved path means the same source by specification."""
+    return str(Path(path).expanduser().resolve())
 
 
 def detect_visual_changes(ffmpeg: str, video: Path, cancel: threading.Event | None = None) -> list[float]:
@@ -317,20 +352,33 @@ def make_timeline(scenes: list[Scene], lengths: list[float], source_duration: fl
 
     # visual_changes is retained in the public signature for project/test compatibility,
     # but default placement is intentionally deterministic and even across the video.
-    saved: dict[str, dict] = {}
+    saved: dict[tuple[str, str], dict] = {}
+    saved_by_index: dict[int, dict] = {}
     for row in review_states or []:
         if not isinstance(row, dict) or row.get("video_id") != source_id:
             continue
-        key = row.get("caption")
-        if isinstance(key, str) and key not in saved:
-            saved[key] = row
+        idx = row.get("script_index")
+        if isinstance(idx, int) and idx >= 0 and idx not in saved_by_index:
+            saved_by_index[idx] = row
+        caption = row.get("caption")
+        speech = row.get("speech")
+        if isinstance(caption, str) and isinstance(speech, str):
+            key = (caption, speech)
+            if key not in saved:
+                saved[key] = row
 
     clips: list[Clip] = []
     warnings: list[str] = []
     previous_end = 0.0
     even_starts = _even_starts(lengths, source_duration, gap)
     for i, (scene, length) in enumerate(zip(scenes, lengths), 1):
-        row = saved.get(scene.caption)
+        row = saved_by_index.get(i - 1)
+        # Never trust an index alone after insert/delete edits. The row must still
+        # describe the same caption+speech; otherwise fall back to content matching.
+        if row is not None and (row.get("caption") != scene.caption or row.get("speech") != scene.speech):
+            row = None
+        if row is None:
+            row = saved.get((scene.caption, scene.speech))
         reason = ""
         if row is not None:
             try:
@@ -374,18 +422,68 @@ def make_timeline(scenes: list[Scene], lengths: list[float], source_duration: fl
     return clips, warnings
 
 
+def voice_cache_dir() -> Path:
+    """Internal narration cache. Users never need to manage this folder."""
+    path = ROOT / ".cache" / "voice"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def voice_cache_key(text: str, speaker_id: int, speed: float, engine_url: str) -> str:
+    payload = json.dumps({
+        "text": text,
+        "speaker_id": int(speaker_id),
+        "speed": round(float(speed), 6),
+        "engine_url": checked_url(engine_url),
+    }, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def cached_speech(voice: "Voicevox", text: str, speaker_id: int, speed: float,
+                  engine_url: str) -> tuple[bytes, bool, str]:
+    """Return synthesized WAV, reusing a validated on-disk cache when possible."""
+    key = voice_cache_key(text, speaker_id, speed, engine_url)
+    path = voice_cache_dir() / f"{key}.wav"
+    if path.is_file():
+        try:
+            data = path.read_bytes()
+            wav_length(data)
+            return data, True, key
+        except (OSError, FactoryError):
+            try:
+                path.unlink()
+            except OSError:
+                pass
+    data = voice.synthesize(text, speaker_id, speed)
+    temporary = path.with_suffix(".tmp")
+    try:
+        temporary.write_bytes(data)
+        temporary.replace(path)
+    finally:
+        if temporary.exists():
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
+    return data, False, key
+
+
 def build_review_plan(settings: Settings, log: Callable[[str], None] = print,
                       cancel: threading.Event | None = None,
                       progress: Callable[[float], None] = lambda x: None) -> tuple[list[Clip], list[str], str, list[bytes]]:
     """Create narration lengths, analyze the source timeline, then propose placements."""
+    log("配置確認: 入力検証中…")
     scenes = validate_settings(settings)
     cancel = cancel or threading.Event()
     ffmpeg = find_ffmpeg(settings.ffmpeg_path)
     video = Path(settings.video).resolve()
+    log(f"配置確認: 元動画を確認中… {video}")
     duration = probe_duration(ffmpeg, video, cancel)
     source_id = video_identity(video)
+    log("配置確認: VOICEVOX API接続確認中…")
     voice = Voicevox(settings.engine_url)
     actual = dict((sid, label) for label, sid in voice.speakers())
+    log("配置確認: VOICEVOX API接続確認完了")
     if settings.speaker_id not in actual:
         raise FactoryError("選択した声が見つかりません。「声を読み込み」から選び直してください。")
     settings.speaker_label = actual[settings.speaker_id]
@@ -394,8 +492,10 @@ def build_review_plan(settings: Settings, log: Callable[[str], None] = print,
     for i, scene in enumerate(scenes):
         if cancel.is_set():
             raise Cancelled("中止しました。")
-        log(f"仮配置用の音声を計測 {i + 1}/{len(scenes)}")
-        data = voice.synthesize(scene.speech, settings.speaker_id, settings.speed)
+        data, hit, _cache_key = cached_speech(voice, scene.speech, settings.speaker_id,
+                                                settings.speed, settings.engine_url)
+        log(("音声キャッシュを再利用 " if hit else "仮配置用の音声を生成 ")
+            + f"{i + 1}/{len(scenes)}")
         lengths.append(wav_length(data))
         audio_blobs.append(data)
         progress(55 * (i + 1) / len(scenes))
@@ -443,38 +543,51 @@ def credit_text(settings: Settings) -> str:
             f"公開前に、この話者の利用規約とクレジット表記を確認してください。\n{terms}\n")
 
 
-class NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        raise FactoryError("VOICEVOXからの転送を拒否しました。接続先を確認してください。")
-
-
 class Voicevox:
     def __init__(self, url: str):
         self.url = checked_url(url)
-        self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+        parsed = urllib.parse.urlparse(self.url)
+        self.host = parsed.hostname or "127.0.0.1"
+        self.port = parsed.port or 80
 
-    def request(self, route: str, params: dict | None = None, data=None, timeout=15) -> bytes:
-        endpoint = self.url + route
+    def request(self, route: str, params: dict | None = None, data=None,
+                read_timeout: float = VOICEVOX_READ_TIMEOUT) -> bytes:
+        path = route
         if params:
-            endpoint += "?" + urllib.parse.urlencode(params)
+            path += "?" + urllib.parse.urlencode(params)
         payload = None if data is None else json.dumps(data, ensure_ascii=False).encode("utf-8")
-        req = urllib.request.Request(endpoint, payload, {"Content-Type": "application/json"})
-        if route in ("/audio_query", "/synthesis"):
-            req.method = "POST"
+        headers = {"Content-Type": "application/json"}
+        method = "POST" if route in ("/audio_query", "/synthesis") else "GET"
+        conn = http.client.HTTPConnection(self.host, self.port, timeout=VOICEVOX_CONNECT_TIMEOUT)
         try:
-            with self.opener.open(req, timeout=timeout) as response:
-                return response.read()
-        except urllib.error.HTTPError as exc:
-            raise FactoryError(f"VOICEVOX API エラー ({exc.code})。声を再読み込みして選び直してください。") from exc
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            try:
+                conn.connect()
+            except (socket.timeout, TimeoutError) as exc:
+                raise FactoryError(f"VOICEVOXへの接続がタイムアウトしました。\n接続先: {self.url}") from exc
+            if conn.sock is not None:
+                conn.sock.settimeout(read_timeout)
+            conn.request(method, path, body=payload, headers=headers)
+            try:
+                response = conn.getresponse()
+                body = response.read()
+            except (socket.timeout, TimeoutError) as exc:
+                raise FactoryError(f"VOICEVOXの応答待ちがタイムアウトしました。\n接続先: {self.url}") from exc
+            if not 200 <= response.status < 300:
+                raise FactoryError(f"VOICEVOX API エラー ({response.status})。声を再読み込みして選び直してください。")
+            return body
+        except FactoryError:
+            raise
+        except (OSError, http.client.HTTPException) as exc:
             raise FactoryError("VOICEVOXに接続できません。VOICEVOXを起動し、読み込み完了後に再実行してください。"
                                "\n接続先: " + self.url) from exc
+        finally:
+            conn.close()
 
     def speakers(self) -> list[tuple[str, int]]:
         try:
             raw = json.loads(self.request("/speakers"))
-            return [(f"{s['name']} / {style['name']}", int(style["id"]))
-                    for s in raw for style in s["styles"]
+            return [(f"{sp['name']} / {style['name']}", int(style["id"]))
+                    for sp in raw for style in sp["styles"]
                     if style.get("type", "talk") == "talk"]
         except (ValueError, TypeError, KeyError) as exc:
             raise FactoryError("VOICEVOXの話者一覧が正しくありません。") from exc
@@ -486,7 +599,8 @@ class Voicevox:
                          volumeScale=1.0, outputSamplingRate=24000, outputStereo=False)
         except (ValueError, TypeError, AttributeError) as exc:
             raise FactoryError("VOICEVOXの音声設定を取得できませんでした。") from exc
-        data = self.request("/synthesis", {"speaker": speaker}, query, timeout=180)
+        data = self.request("/synthesis", {"speaker": speaker}, query,
+                            read_timeout=VOICEVOX_SYNTHESIS_READ_TIMEOUT)
         wav_length(data)
         return data
 
@@ -531,6 +645,7 @@ def ensure_output_folders(root: str | Path = "") -> dict[str, Path]:
         "scripts": base / "scripts",
         "videos": base / "videos",
         "audio": base / "audio",
+        "logs": base / "logs",
     }
     for folder in folders.values():
         folder.mkdir(parents=True, exist_ok=True)
@@ -545,9 +660,20 @@ def has_audio_stream(ffmpeg: str, video: Path, cancel=None) -> bool:
     return any("Stream #" in line and "Audio:" in line for line in text.splitlines())
 
 
+def _terminate_process(proc: subprocess.Popen) -> None:
+    if proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=3)
+
+
 def ff_run(args: list[str], cancel: threading.Event | None = None, timeout=1800,
            accept_failure=False) -> bytes:
-    """No shell, no pipe deadlocks, cancellable; caller owns all output paths."""
+    """Run short/diagnostic FFmpeg commands with a bounded total duration."""
     flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
     with tempfile.TemporaryFile() as output:
         proc = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=output,
@@ -558,21 +684,71 @@ def ff_run(args: list[str], cancel: threading.Event | None = None, timeout=1800,
                 if cancel and cancel.is_set():
                     raise Cancelled("中止しました。元の録画は変更していません。")
                 if time.monotonic() - started > timeout:
-                    raise FactoryError("動画処理がタイムアウトしました。短い録画で再実行してください。")
+                    raise FactoryError("FFmpeg処理が規定時間を超えたため停止しました。")
                 time.sleep(.08)
         finally:
             if proc.poll() is None:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait()
+                _terminate_process(proc)
         output.seek(0)
         result = output.read()
     if proc.returncode and not accept_failure:
         tail = result.decode("utf-8", "replace")[-6000:]
-        raise FactoryError("FFmpegで処理に失敗しました。詳細:\n" + tail)
+        raise FactoryError(f"FFmpegが異常終了しました (終了コード {proc.returncode})。詳細:\n{tail}")
+    return result
+
+
+def ff_run_progress(args: list[str], cancel: threading.Event | None = None,
+                    stall_timeout: float = FFMPEG_STALL_TIMEOUT) -> bytes:
+    """Run a long FFmpeg job and abort only when progress stops for too long."""
+    flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    progress_args = list(args[:-1]) + ["-progress", "pipe:1", "-nostats", args[-1]]
+    proc = subprocess.Popen(progress_args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, creationflags=flags)
+    q: "queue.Queue[bytes | None]"
+    import queue as _queue
+    q = _queue.Queue()
+    chunks: list[bytes] = []
+
+    def reader():
+        try:
+            assert proc.stdout is not None
+            for line in iter(proc.stdout.readline, b""):
+                q.put(line)
+        finally:
+            q.put(None)
+
+    threading.Thread(target=reader, daemon=True).start()
+    last_progress = time.monotonic()
+    last_marker: bytes | None = None
+    try:
+        eof = False
+        while proc.poll() is None or not eof:
+            if cancel and cancel.is_set():
+                raise Cancelled("中止しました。元の録画は変更していません。")
+            try:
+                item = q.get(timeout=.2)
+                if item is None:
+                    eof = True
+                    continue
+                chunks.append(item)
+                if item.startswith((b"out_time_ms=", b"out_time_us=", b"frame=", b"progress=")):
+                    if item != last_marker:
+                        last_marker = item
+                        last_progress = time.monotonic()
+            except _queue.Empty:
+                pass
+            if proc.poll() is None and time.monotonic() - last_progress > stall_timeout:
+                raise FactoryError(f"FFmpegの進捗が{int(stall_timeout)}秒以上停止したため異常終了と判断しました。")
+        proc.wait()
+    finally:
+        if proc.poll() is None:
+            _terminate_process(proc)
+        if proc.stdout is not None:
+            proc.stdout.close()
+    result = b"".join(chunks)
+    if proc.returncode:
+        tail = result.decode("utf-8", "replace")[-6000:]
+        raise FactoryError(f"FFmpegが異常終了しました (終了コード {proc.returncode})。詳細:\n{tail}")
     return result
 
 
@@ -603,29 +779,42 @@ def japanese_font(explicit: str = "") -> str:
 
 
 def product_title_parts(title: str) -> tuple[str, str, str]:
-    """Split a Promnica product title into PMN number, codename and Japanese name.
+    """Split an optional generic three-part product title.
 
-    Accepted examples:
-      PMN-001 TERMINUS 終末時限装置
-      PMN-001 / TERMINUS / 終末時限装置
-      PMN-001\nTERMINUS\n終末時限装置
-    Literal ``\\n`` typed into the one-line title field is also treated as a separator.
+    MONTAZH does not require PMN naming.  A title is treated as a structured
+    product title only when it looks like::
+
+        PRODUCT-NO  ENGLISH-NAME  日本語名
+
+    The first field must contain at least one digit, the second field must be
+    an ASCII-style name, and the final field must contain non-ASCII text.
+    Examples include ``PMN-001 TERMINUS 終末時限装置`` and
+    ``AX-12 CLEANER 重複ファイル整理``.  Everything else is rendered as one
+    ordinary free-form title.
+
+    Slash-separated input is accepted for convenience.
     """
-    value = str(title or "").replace("\\r", " ").replace("\\n", " ")
-    value = value.replace("\r", " ").replace("\n", " ").replace("\t", " ")
+    value = str(title or "").replace("\\r", " " ).replace("\\n", " " )
+    value = value.replace("\r", " " ).replace("\n", " " ).replace("\t", " " )
     value = re.sub(r"\s*/\s*", " ", value)
     value = re.sub(r"\s+", " ", value).strip()
-    match = re.match(r"^(PMN-\d{3,4})\s+([A-Za-z][A-Za-z0-9_-]*)(?:\s+(.*))?$", value, re.IGNORECASE)
+    match = re.match(r"^([A-Za-z0-9][A-Za-z0-9._-]*\d[A-Za-z0-9._-]*)\s+([A-Za-z][A-Za-z0-9._-]*)\s+(.+)$", value)
     if not match:
         return "", "", value
-    return match.group(1).upper(), match.group(2).upper(), (match.group(3) or "").strip()
+    product_no, english_name, display_name = match.groups()
+    # Do not reinterpret a normal all-ASCII title merely because it starts
+    # with a model-like token. Structured mode is intended for a final local
+    # language/product name, not arbitrary prose.
+    if display_name.isascii():
+        return "", "", value
+    return product_no, english_name, display_name.strip()
 
 
 def safe_output_stem(title: str) -> str:
     """Return a Windows-safe, short output stem independent from display wrapping."""
-    pmn, codename, _jp = product_title_parts(title)
-    if pmn and codename:
-        return f"{pmn}_{codename}"
+    product_no, english_name, _local_name = product_title_parts(title)
+    if product_no and english_name:
+        return f"{product_no}_{english_name}"
     value = str(title or "").replace("\\r", "_").replace("\\n", "_")
     value = re.sub(r"[\x00-\x1f<>:\"/\\\\|?*]+", "_", value)
     value = re.sub(r"\s+", "_", value.strip())
@@ -739,16 +928,22 @@ def _place_logo(im: Image.Image, settings: Settings) -> None:
 def make_overlay(settings: Settings, caption: str, index: int, count: int, path: Path):
     width, height = PRESETS[settings.preset]
     font_path = japanese_font(settings.font_path)
-    im = Image.new("RGBA", (width, height), BG)
+    colors = theme_colors(settings)
+    bg = colors["bg"]
+    text_color = colors["text"]
+    accent = colors["accent"]
+    muted = colors["muted"]
+    im = Image.new("RGBA", (width, height), bg)
     draw = ImageDraw.Draw(im)
     x, y, vw, vh = layout(width, height)
     draw.rectangle((x, y, x + vw - 1, y + vh - 1), fill=(0, 0, 0, 0))
     unit = width / 1080 if height > width else height / 1920
     margin = int(width * .065)
-    pmn, codename, japanese = product_title_parts(settings.title)
+    product_no, english_name, local_name = product_title_parts(settings.title)
 
     small = ImageFont.truetype(font_path, max(18, int(25 * unit)))
-    draw.text((margin, int(height * .060)), "PROMNICA  /  FIELD REPORT", font=small, fill=ACCENT)
+    if settings.header_text.strip():
+        draw.text((margin, int(height * .060)), settings.header_text.strip(), font=small, fill=accent)
 
     if height > width:
         # Portrait title hierarchy:
@@ -757,55 +952,66 @@ def make_overlay(settings: Settings, caption: str, index: int, count: int, path:
         # This leaves substantially more room for the actual screen recording.
         right_reserved = int(width * .245) if settings.logo_path.strip() else margin
         usable = max(int(width * .50), width - margin - right_reserved)
-        if pmn and codename:
-            model_text = f"{pmn}  /  {codename}"
+        if product_no and english_name:
+            model_text = f"{product_no}  /  {english_name}"
             model_box = (margin, int(height * .101), usable, int(height * .050))
             text_in_box(draw, model_text, font_path, model_box,
-                        int(48 * unit), int(30 * unit), color="#f4f7fa", max_lines=1)
-            if japanese:
+                        int(48 * unit), int(30 * unit), color=text_color, max_lines=1)
+            if local_name:
                 jp_box = (margin, int(height * .151), usable, int(height * .070))
-                text_in_box(draw, japanese, font_path, jp_box,
-                            int(60 * unit), int(34 * unit), color="#f4f7fa", max_lines=2)
+                text_in_box(draw, local_name, font_path, jp_box,
+                            int(60 * unit), int(34 * unit), color=text_color, max_lines=2)
         else:
             title_box = (margin, int(height * .101), usable, int(height * .120))
             text_in_box(draw, settings.title, font_path, title_box,
-                        int(58 * unit), int(30 * unit), max_lines=2)
+                        int(58 * unit), int(30 * unit), color=text_color, max_lines=2)
     else:
         # Landscape keeps the same hierarchy but uses the top strip to the right
         # of the source-video area.
         title_x = int(width * .30)
         title_w = int(width * .56)
-        if pmn and codename:
+        if product_no and english_name:
             model_box = (title_x, int(height * .018), title_w, int(height * .055))
-            text_in_box(draw, f"{pmn}  /  {codename}", font_path, model_box, 42, 26, max_lines=1)
-            if japanese:
+            text_in_box(draw, f"{product_no}  /  {english_name}", font_path, model_box, 42, 26, max_lines=1)
+            if local_name:
                 jp_box = (title_x, int(height * .072), title_w, int(height * .058))
-                text_in_box(draw, japanese, font_path, jp_box, 46, 26, max_lines=1)
+                text_in_box(draw, local_name, font_path, jp_box, 46, 26, max_lines=1)
         else:
             title_box = (title_x, int(height * .018), title_w, int(height * .112))
-            text_in_box(draw, settings.title, font_path, title_box, 48, 26, max_lines=2)
+            text_in_box(draw, settings.title, font_path, title_box, 48, 26, color=text_color, max_lines=2)
 
-    bottom_y = int(height * .725) if height > width else int(height * .775)
-    draw.rectangle((margin, bottom_y, margin + int(width * .07), bottom_y + max(3, int(4 * unit))), fill=ACCENT)
+    # Place captions directly below the source-video area in portrait mode so they stay
+    # readable in Shorts/Reels without covering the screen recording itself.
+    if height > width:
+        video_bottom = y + vh
+        bottom_y = min(int(height * .742), video_bottom + int(height * .014))
+        subtitle_top = bottom_y + int(height * .014)
+        subtitle_height = int(height * .100)
+    else:
+        bottom_y = int(height * .775)
+        subtitle_top = bottom_y + int(height * .025)
+        subtitle_height = int(height * .165)
+    draw.rectangle((margin, bottom_y, margin + int(width * .07), bottom_y + max(3, int(4 * unit))), fill=accent)
     # Caption can use nearly the full width: the icon lives in the title/header zone.
     subtitle_usable = width - margin * 2
-    subtitle_box = (margin, bottom_y + int(height * .025), subtitle_usable, int(height * .165))
+    subtitle_box = (margin, subtitle_top, subtitle_usable, subtitle_height)
     text_in_box(draw, caption, font_path, subtitle_box, int(57 * unit) if height > width else 49,
-                int(29 * unit) if height > width else 25, max_lines=5 if height > width else 4)
+                int(29 * unit) if height > width else 25, color=text_color, max_lines=4 if height > width else 4)
     if index > 0:
-        draw.text((margin, int(height * .922)), f"{index:02d} / {count:02d}", font=small, fill="#93a0ad")
+        draw.text((margin, int(height * .922)), f"{index:02d} / {count:02d}", font=small, fill=muted)
     _place_logo(im, settings)
     im.save(path)
 
 def video_filter(settings: Settings, take: float, duration: float) -> str:
     width, height = PRESETS[settings.preset]
     x, y, vw, vh = layout(width, height)
+    bg = theme_colors(settings)["bg"]
     # Normalize sample aspect ratio BEFORE fitting anamorphic sources.
     return (f"[0:v:0]trim=duration={take:.6f},setpts=PTS-STARTPTS,"
             "scale=trunc(iw*sar/2)*2:ih,setsar=1,"
             f"scale={vw}:{vh}:force_original_aspect_ratio=decrease:force_divisible_by=2,"
-            f"pad={vw}:{vh}:(ow-iw)/2:(oh-ih)/2:color={BG},"
-            f"pad={width}:{height}:{x}:{y}:color={BG},fps=30,"
+            f"pad={vw}:{vh}:(ow-iw)/2:(oh-ih)/2:color={bg},"
+            f"pad={width}:{height}:{x}:{y}:color={bg},fps=30,"
             f"tpad=stop_mode=clone:stop_duration={duration:.6f},trim=duration={duration:.6f}[screen];"
             "[screen][1:v]overlay=0:0:format=auto,format=yuv420p[v]")
 
@@ -814,16 +1020,31 @@ def video_filter(settings: Settings, take: float, duration: float) -> str:
 def base_video_filter(settings: Settings) -> str:
     width, height = PRESETS[settings.preset]
     x, y, vw, vh = layout(width, height)
+    bg = theme_colors(settings)["bg"]
     return ("[0:v:0]setpts=PTS-STARTPTS,scale=trunc(iw*sar/2)*2:ih,setsar=1,"
             f"scale={vw}:{vh}:force_original_aspect_ratio=decrease:force_divisible_by=2,"
-            f"pad={vw}:{vh}:(ow-iw)/2:(oh-ih)/2:color={BG},"
-            f"pad={width}:{height}:{x}:{y}:color={BG},fps=30[screen]")
+            f"pad={vw}:{vh}:(ow-iw)/2:(oh-ih)/2:color={bg},"
+            f"pad={width}:{height}:{x}:{y}:color={bg},fps=30[screen]")
 
 def validate_settings(settings: Settings, require_voice=True) -> list[Scene]:
     if not settings.video or not Path(settings.video).is_file():
         raise FactoryError("録画ファイルを選択してください。")
+    try:
+        video_path = Path(settings.video).expanduser()
+        if video_path.stat().st_size <= 0:
+            raise OSError("empty file")
+        with video_path.open("rb") as handle:
+            handle.read(1)
+    except OSError as exc:
+        raise FactoryError(f"元動画を読み込めません: {settings.video}") from exc
+    if settings.output_mode not in OUTPUT_MODES:
+        raise FactoryError("書き出し用途を選び直してください。")
     if settings.preset not in PRESETS:
         raise FactoryError("出力サイズを選び直してください。")
+    if settings.output_mode == SHORT_MODE and settings.preset not in SHORT_PRESETS:
+        raise FactoryError("ショート動画は縦9:16の出力サイズを選んでください。")
+    if settings.output_mode == NORMAL_MODE and settings.preset not in NORMAL_PRESETS:
+        raise FactoryError("通常動画は横16:9の出力サイズを選んでください。")
     if not settings.title.strip() or len(settings.title) > 120:
         raise FactoryError("タイトルは1〜120文字にしてください。")
     try:
@@ -857,30 +1078,182 @@ def validate_settings(settings: Settings, require_voice=True) -> list[Scene]:
     return parse_script(settings.script)
 
 
+def _project_payload(settings: Settings) -> bytes:
+    return json.dumps({"schema_version": PROJECT_SCHEMA_VERSION, "app_version": VERSION,
+                       "settings": asdict(settings)},
+                      ensure_ascii=False, indent=2).encode("utf-8")
+
+
+def _fsync_file(path: Path) -> None:
+    with path.open("r+b") as handle:
+        os.fsync(handle.fileno())
+
+
+def _atomic_replace(temp: Path, target: Path) -> None:
+    _fsync_file(temp)
+    os.replace(temp, target)
+
+
 def save_project(path: Path, settings: Settings) -> None:
-    data = json.dumps({"version": VERSION, "settings": asdict(settings)}, ensure_ascii=False, indent=2)
-    fd, name = tempfile.mkstemp(prefix="pmn003_save_", suffix=".tmp", dir=path.parent)
+    """Atomically save a complete project snapshot. Existing good files remain intact on failure."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = _project_payload(settings)
+    if path.suffix.lower() != ".montazh":
+        fd, name = tempfile.mkstemp(prefix="pmn003_save_", suffix=".tmp", dir=path.parent)
+        temporary = Path(name)
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(payload); handle.flush(); os.fsync(handle.fileno())
+            json.loads(temporary.read_text(encoding="utf-8"))
+            os.replace(temporary, path)
+        finally:
+            if temporary.exists():
+                temporary.unlink()
+        return
+
+    referenced: set[str] = set()
+    if settings.speaker_id >= 0:
+        for scene in parse_script(settings.script):
+            referenced.add(voice_cache_key(scene.speech, settings.speaker_id, settings.speed, settings.engine_url))
+    fd, name = tempfile.mkstemp(prefix="pmn003_project_", suffix=".tmp", dir=path.parent)
+    os.close(fd)
     temporary = Path(name)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(data)
-        temporary.replace(path)
+        with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("project.json", payload)
+            cache_root = voice_cache_dir()
+            for key in sorted(referenced):
+                wav = cache_root / f"{key}.wav"
+                if wav.is_file():
+                    archive.write(wav, f"audio_cache/{key}.wav")
+        with zipfile.ZipFile(temporary, "r") as check:
+            bad = check.testzip()
+            if bad:
+                raise FactoryError(f"プロジェクト一時保存の検査に失敗しました: {bad}")
+            _settings_from_payload(check.read("project.json"))
+        _atomic_replace(temporary, path)
     finally:
         if temporary.exists():
             temporary.unlink()
 
 
-def load_project(path: Path) -> Settings:
-    if path.stat().st_size > 1024 * 1024:
-        raise FactoryError("プロジェクトファイルが大きすぎます。")
+def _settings_from_payload(payload: bytes) -> Settings:
     try:
-        data = json.loads(path.read_text(encoding="utf-8-sig"))
-        obj = Settings.from_dict(data["settings"])
-        # Never execute a binary supplied by an imported project file.
+        data = json.loads(payload.decode("utf-8-sig"))
+        if not isinstance(data, dict):
+            raise FactoryError("プロジェクトの形式が正しくありません。")
+        schema = data.get("schema_version")
+        if schema is None:
+            # Real legacy v0.3.x schema: {version, settings}. Convert only this known shape.
+            if set(data).issuperset({"version", "settings"}) and isinstance(data.get("settings"), dict):
+                obj = Settings.from_dict(data["settings"], strict=False)
+            else:
+                raise FactoryError("旧形式プロジェクトとして認識できません。")
+        elif schema == 1:
+            # Known v0.3.4 schema. Preserve the former fixed Promnica header
+            # while upgrading to the configurable public-template setting.
+            if set(data) != {"schema_version", "app_version", "settings"} or not isinstance(data.get("settings"), dict):
+                raise FactoryError("旧schemaプロジェクトの構造が一致しません。")
+            migrated = dict(data["settings"])
+            migrated.setdefault("header_text", "PROMNICA / FIELD REPORT")
+            migrated.setdefault("theme_id", DEFAULT_THEME)
+            obj = Settings.from_dict(migrated, strict=True)
+        elif schema == 2:
+            # Known v0.3.5 schema: add the new project theme with the former visual as default.
+            if set(data) != {"schema_version", "app_version", "settings"} or not isinstance(data.get("settings"), dict):
+                raise FactoryError("旧schemaプロジェクトの構造が一致しません。")
+            migrated = dict(data["settings"])
+            migrated.setdefault("theme_id", DEFAULT_THEME)
+            obj = Settings.from_dict(migrated, strict=True)
+        elif schema == PROJECT_SCHEMA_VERSION:
+            if set(data) != {"schema_version", "app_version", "settings"}:
+                raise FactoryError("プロジェクトのトップレベル構造が一致しません。")
+            obj = Settings.from_dict(data["settings"], strict=True)
+        else:
+            raise FactoryError(f"未対応のMONTAZHプロジェクトschema_versionです: {schema}")
+        # Never execute a binary path supplied by an imported project file.
         obj.ffmpeg_path = ""
         return obj
-    except (ValueError, KeyError, TypeError) as exc:
-        raise FactoryError("PMN-003のプロジェクトJSONを選択してください。") from exc
+    except FactoryError:
+        raise
+    except (UnicodeDecodeError, ValueError, KeyError, TypeError) as exc:
+        raise FactoryError("PMN-003のプロジェクトファイルを選択してください。") from exc
+
+
+def _validate_project_source_reference(settings: Settings) -> None:
+    if not settings.video:
+        raise FactoryError("プロジェクトの元動画参照が空です。")
+    video = Path(settings.video).expanduser()
+    if not video.is_file():
+        raise FactoryError(f"元動画が見つかりません: {video}")
+    try:
+        if video.stat().st_size <= 0:
+            raise OSError("empty file")
+        with video.open("rb") as handle:
+            handle.read(1)
+    except OSError as exc:
+        raise FactoryError(f"元動画を読み込めません: {video}") from exc
+    # Project-load validation is intentionally content-agnostic: same path is the same
+    # logical material, but the current bytes must still be a readable video.
+    try:
+        probe_duration(find_ffmpeg(""), video, None)
+    except FactoryError as exc:
+        raise FactoryError(f"元動画を正常に読み込めません: {video}") from exc
+
+
+def load_project(path: Path) -> Settings:
+    path = Path(path)
+    if not path.is_file():
+        raise FactoryError("プロジェクトファイルが見つかりません。")
+    cache_items: list[tuple[str, bytes]] = []
+    if zipfile.is_zipfile(path):
+        if path.stat().st_size > 150 * 1024 * 1024:
+            raise FactoryError("プロジェクトファイルが大きすぎます。")
+        try:
+            with zipfile.ZipFile(path, "r") as archive:
+                if archive.testzip():
+                    raise FactoryError("MONTAZHプロジェクトZIPが破損しています。")
+                payload = archive.read("project.json")
+                if len(payload) > 2 * 1024 * 1024:
+                    raise FactoryError("プロジェクト情報が大きすぎます。")
+                obj = _settings_from_payload(payload)
+                _validate_project_source_reference(obj)
+                for info in archive.infolist():
+                    m = re.fullmatch(r"audio_cache/([0-9a-f]{64})\.wav", info.filename)
+                    if not m:
+                        continue
+                    if info.file_size > 20 * 1024 * 1024:
+                        raise FactoryError("音声キャッシュが大きすぎます。")
+                    data = archive.read(info)
+                    wav_length(data)
+                    cache_items.append((m.group(1), data))
+        except FactoryError:
+            raise
+        except (zipfile.BadZipFile, KeyError, OSError) as exc:
+            raise FactoryError("MONTAZHプロジェクトを読み込めませんでした。") from exc
+    else:
+        if path.stat().st_size > 2 * 1024 * 1024:
+            raise FactoryError("プロジェクトファイルが大きすぎます。")
+        try:
+            obj = _settings_from_payload(path.read_bytes())
+            _validate_project_source_reference(obj)
+        except OSError as exc:
+            raise FactoryError("プロジェクトファイルを読み込めませんでした。") from exc
+
+    # Commit auxiliary cache only after the complete project snapshot has been validated.
+    cache_root = voice_cache_dir()
+    for key, data in cache_items:
+        target = cache_root / f"{key}.wav"
+        temp = target.with_suffix(".tmp")
+        try:
+            temp.write_bytes(data)
+            wav_length(temp.read_bytes())
+            os.replace(temp, target)
+        finally:
+            if temp.exists():
+                temp.unlink()
+    return obj
 
 
 def srt_time(value: float) -> str:
@@ -931,8 +1304,9 @@ def render(settings: Settings, log: Callable[[str], None] = print,
         for i, scene in enumerate(scenes):
             if cancel.is_set():
                 raise Cancelled("中止しました。")
-            report(f"音声生成 {i + 1}/{len(scenes)}")
-            data = voice.synthesize(scene.speech, settings.speaker_id, settings.speed)
+            data, hit, _cache_key = cached_speech(voice, scene.speech, settings.speaker_id,
+                                                settings.speed, settings.engine_url)
+            report(("音声キャッシュ再利用 " if hit else "音声生成 ") + f"{i + 1}/{len(scenes)}")
             wav = audio_dir / f"{i + 1:03d}.wav"
             wav.write_bytes(data)
             wavs.append(wav)
@@ -960,14 +1334,19 @@ def render(settings: Settings, log: Callable[[str], None] = print,
 
         timeline_rows = []
         for i, c in enumerate(clips):
-            row = {"caption": c.scene.caption, "speech": c.scene.speech, "start": c.start,
+            row = {"caption": c.scene.caption, "speech": c.scene.speech, "script_index": i, "start": c.start,
                    "end": c.start + c.audio_duration, "audio_duration": c.audio_duration,
                    "reason": getattr(c, "reason", ""), "video_id": source_id}
             timeline_rows.append(row)
         (job / "timeline.json").write_text(json.dumps({"total_seconds": source_duration,
             "source_seconds": source_duration, "video_id": source_id, "warnings": warnings,
             "placements": timeline_rows}, ensure_ascii=False, indent=2), encoding="utf-8")
-        (job / "subtitles.srt").write_text("\n\n".join(
+        # Keep the optional SRT away from the finished MP4. Some media players
+        # automatically load nearby subtitle files, which would make MONTAZH's
+        # already-burned-in captions appear twice during normal playback.
+        metadata_dir = job / "metadata"
+        metadata_dir.mkdir(parents=True, exist_ok=True)
+        (metadata_dir / "subtitles.srt").write_text("\n\n".join(
             f"{i + 1}\n{srt_time(c.start)} --> {srt_time(c.start + c.audio_duration)}\n{c.scene.caption}"
             for i, c in enumerate(clips)) + "\n", encoding="utf-8-sig")
         (job / "credits.txt").write_text(credit_text(settings), encoding="utf-8-sig")
@@ -1044,7 +1423,7 @@ def render(settings: Settings, log: Callable[[str], None] = print,
                     ])
                 else:
                     report("元動画に音声トラックがありません。VOICEVOX音声のみで書き出します。")
-            pending = job / "video.partial.mp4"
+            pending = job / "video.mp4.part"
             report("元動画を最後まで保持して、音声と字幕を配置しています…")
             args += ["-filter_complex", ";".join(filters), "-map", "[v]"]
             if use_source_audio:
@@ -1054,18 +1433,24 @@ def render(settings: Settings, log: Callable[[str], None] = print,
             args += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-threads", "4",
                      "-pix_fmt", "yuv420p", "-ar", "48000", "-ac", "2",
                      "-c:a", "aac", "-b:a", "192k", "-t", f"{source_duration:.6f}", "-movflags", "+faststart",
-                     str(pending)]
-            ff_run(args, cancel)
+                     "-f", "mp4", str(pending)]
+            ff_run_progress(args, cancel)
             progress(94)
             report("完成ファイルを検査しています…")
             ff_run([ffmpeg, "-hide_banner", "-v", "error", "-xerror", "-i", str(pending),
                     "-map", "0:v:0", "-map", "0:a:0", "-f", "null", "-"], cancel)
             final = job / f"{safe_title}.mp4"
-            pending.rename(final)
+            os.replace(pending, final)
         progress(100)
         report(f"完成: {final}")
         return final
     except Exception as exc:
+        try:
+            pending_path = job / "video.mp4.part"
+            if pending_path.exists():
+                pending_path.unlink()
+        except OSError:
+            pass
         report(f"停止: {exc}\n作業記録: {job}")
         raise
 

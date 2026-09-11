@@ -1,0 +1,11 @@
+.venv/
+.venv-build/
+__pycache__/
+*.pyc
+build/
+dist/
+*.spec
+output/
+last_project.json
+
+user_settings.json

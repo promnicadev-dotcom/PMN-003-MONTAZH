@@ -20,7 +20,7 @@ jobs:
           cache: 'pip'
 
       - name: Install build dependencies
-        run: python -m pip install -r requirements-build.txt
+        run: python -m pip install -r requirements-release-build.txt
 
       - name: Read version
         shell: pwsh
@@ -37,13 +37,15 @@ jobs:
             --windowed `
             --onedir `
             --name PMN-003_MONTAZH `
-            --collect-all imageio_ffmpeg `
+            --exclude-module imageio_ffmpeg `
             app.py
 
       - name: Package
         shell: pwsh
         run: |
-          $zip = "PMN-003_MONTAZH_v$env:APP_VERSION_Windows_x64.zip"
+          Copy-Item -Force "RELEASE_README.txt" "dist/PMN-003_MONTAZH/README.txt"
+          Copy-Item -Force "THIRD_PARTY_NOTICES.txt" "dist/PMN-003_MONTAZH/THIRD_PARTY_NOTICES.txt"
+          $zip = "PMN-003_MONTAZH_v$($env:APP_VERSION)_Windows_x64.zip"
           Compress-Archive -Path "dist/PMN-003_MONTAZH/*" -DestinationPath $zip -Force
           "RELEASE_ZIP=$zip" >> $env:GITHUB_ENV
 
