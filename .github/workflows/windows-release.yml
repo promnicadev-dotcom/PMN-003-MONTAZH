@@ -1,124 +1,95 @@
-name: Apply v0.3.8 UX final
+name: Build Windows release
 
 on:
   push:
     branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  migrate-build:
+  build:
     runs-on: windows-latest
+    outputs:
+      app_version: ${{ steps.version.outputs.version }}
+
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
-      - name: Apply verified UX-final delta
-        shell: bash
+      - name: Read application version
+        id: version
+        shell: pwsh
         run: |
-          python - <<'PY'
-          from pathlib import Path
-          
-          EXPECTED = {
-              'app.py': '6ad444ea4728ae9b5e7d71caf6273632aac0257c',
-              'engine.py': '1edb053c873d6b54eed0a60e822725342f87586f',
-              'README.md': '4f57f4b6bdcf68ee430b5e619c24277539489852',
-              'README.txt': 'cdc907696bae4eb4797ab3d4da52e7da137654af',
-              'RELEASE_README.txt': '57660d233ebe58dadacbcbe1bc3a6e17fa7e1649',
-          }
-          
-          import hashlib
-          
-          def blob_sha(data: bytes) -> str:
-              return hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
-          
-          for name, expected in EXPECTED.items():
-              data = Path(name).read_bytes()
-              actual = blob_sha(data)
-              if actual != expected:
-                  raise SystemExit(f'{name}: unexpected source blob {actual}, expected {expected}')
-          
-          
-          def replace_once(path, old, new):
-              p = Path(path)
-              text = p.read_text(encoding='utf-8')
-              if text.count(old) != 1:
-                  raise SystemExit(f'{path}: expected replacement block exactly once, found {text.count(old)}')
-              p.write_text(text.replace(old, new, 1), encoding='utf-8', newline='')
-          
-          replace_once('app.py',
-          '''        self._style()\n        self._build()\n        self.vars["engine_url"].trace_add("write", self._engine_url_changed)\n''',
-          '''        self._style()\n        self._build()\n        self._install_wheel_behavior()\n        self.vars["engine_url"].trace_add("write", self._engine_url_changed)\n''')
-          
-          replace_once('app.py',
-          '''        self.engine_choice = ttk.Combobox(right, textvariable=self.engine_choice_label,\n            values=[*ENGINE_PRESETS, CUSTOM_ENGINE], state="readonly", width=32)\n''',
-          '''        self.engine_choice = ttk.Combobox(right, textvariable=self.engine_choice_label,\n            values=list(ENGINE_PRESETS), state="readonly", width=32)\n''')
-          
-          replace_once('app.py',
-          '''    def _scroll_form(self, event):\n        widget = event.widget\n        # Text/selection fields keep their own scrolling behavior.\n        if isinstance(widget, (tk.Text, tk.Listbox, ttk.Combobox, ttk.Spinbox)):\n            return\n        while widget is not None and widget is not self.form_body:\n            widget = getattr(widget, "master", None)\n        if widget is None and event.widget is not self.form_canvas:\n            return\n        if self.form_body.winfo_reqheight() <= self.form_canvas.winfo_height():\n            return\n        if getattr(event, "num", None) in (4, 5):\n            units = -1 if event.num == 4 else 1\n        elif event.delta:\n            units = -int(event.delta / 120) or (-1 if event.delta > 0 else 1)\n        else:\n            return\n        self.form_canvas.yview_scroll(units, "units")\n        return "break"\n''',
-          '''    @staticmethod\n    def _wheel_units(event):\n        if getattr(event, "num", None) in (4, 5):\n            return -1 if event.num == 4 else 1\n        delta = getattr(event, "delta", 0)\n        if delta:\n            return -int(delta / 120) or (-1 if delta > 0 else 1)\n        return 0\n\n    def _scroll_outer(self, units):\n        if not units or self.form_body.winfo_reqheight() <= self.form_canvas.winfo_height():\n            return\n        self.form_canvas.yview_scroll(units, "units")\n\n    def _scroll_form(self, event):\n        widget = event.widget\n        # Open combobox pop-downs are Tk Listboxes and keep native wheel scrolling.\n        # The script Text has its own edge-aware handoff handler below.\n        if isinstance(widget, (tk.Text, tk.Listbox)):\n            return\n        while widget is not None and widget is not self.form_body:\n            widget = getattr(widget, "master", None)\n        if widget is None and event.widget is not self.form_canvas:\n            return\n        units = self._wheel_units(event)\n        if not units:\n            return\n        self._scroll_outer(units)\n        return "break"\n\n    def _wheel_control_to_outer(self, event):\n        # Closed Combobox/Spinbox: wheel means page navigation, never value changes.\n        # The expanded Combobox list is a separate Tk Listbox and remains scrollable.\n        self._scroll_outer(self._wheel_units(event))\n        return "break"\n\n    def _wheel_script_or_outer(self, event):\n        units = self._wheel_units(event)\n        if not units:\n            return "break"\n        first, last = self.script.yview()\n        can_scroll_inside = (units < 0 and first > 0.0001) or (units > 0 and last < 0.9999)\n        if can_scroll_inside:\n            self.script.yview_scroll(units, "units")\n        else:\n            self._scroll_outer(units)\n        return "break"\n\n    def _install_wheel_behavior(self):\n        # Replace ttk's default wheel-to-value behavior on closed selection controls.\n        # The drop-down itself is a Listbox, so long speaker lists still use the wheel normally.\n        for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):\n            self.bind_class("TCombobox", sequence, self._wheel_control_to_outer)\n            self.bind_class("TSpinbox", sequence, self._wheel_control_to_outer)\n            self.script.bind(sequence, self._wheel_script_or_outer)\n''')
-          
-          replace_once('app.py',
-          '''    def _engine_selected(self, _event=None):\n        label = self.engine_choice_label.get()\n        if label == CUSTOM_ENGINE:\n            self._advanced()\n            self.engine_choice_label.set(engine_preset(self.vars["engine_url"].get()))\n            return\n        if self.vars["engine_url"].get() != ENGINE_PRESETS[label]:\n''',
-          '''    def _engine_selected(self, _event=None):\n        label = self.engine_choice_label.get()\n        # Custom endpoints are configured only from 詳細設定; they are not a drop-down item.\n        if label not in ENGINE_PRESETS:\n            return\n        if self.vars["engine_url"].get() != ENGINE_PRESETS[label]:\n''')
-          
-          replace_once('engine.py',
-          '''            final = job / f"{safe_title}.mp4"\n            os.replace(pending, final)\n        progress(100)\n''',
-          '''            final = job / f"{safe_title}.mp4"\n            os.replace(pending, final)\n            # Preserve the exact project state that produced this successful MP4.\n            # This is written only after the MP4 has passed FFmpeg validation and been finalized.\n            completed_project = job / f"{safe_title}.montazh"\n            save_project(completed_project, settings)\n            report(f"完成プロジェクトを保存: {completed_project}")\n        progress(100)\n''')
-          
-          README_ADD = '''\n\n## 公開前UX最終調整\n\n- 音声エンジンのプルダウンから「カスタム（詳細設定）」を削除。任意の接続先は「詳細設定」から指定します。\n- 閉じたコンボボックス/Spinbox上のマウスホイールでは値を変更せず、画面全体をスクロールします。候補一覧を展開している間は、その候補一覧をホイールでスクロールできます。\n- 台本欄は内部にスクロール余地がある間は台本をスクロールし、最上端/最下端でさらに回した場合は外側の画面スクロールへ引き継ぎます。\n- MP4正常完成時には、同じ成果物フォルダへ完成時点の `.montazh` プロジェクトも自動保存します。\n'''
-          README_TXT_ADD = '''\n\n- 完成したMP4と同じフォルダに、完成時点の .montazh も自動保存します。\n- 閉じた選択欄ではホイール操作で値を変更しません。候補一覧を開いている間は一覧をホイールでスクロールできます。\n'''
-          RELEASE_ADD = '''\n\n- MP4正常完成時、完成時点の .montazh を同じ成果物フォルダへ自動保存します。\n'''
-          for path, add in [('README.md', README_ADD), ('README.txt', README_TXT_ADD), ('RELEASE_README.txt', RELEASE_ADD)]:
-              p = Path(path)
-              text = p.read_text(encoding='utf-8-sig' if path == 'RELEASE_README.txt' else 'utf-8')
-              if add.strip() in text:
-                  raise SystemExit(f'{path}: UX block already present')
-              encoding = 'utf-8-sig' if path == 'RELEASE_README.txt' else 'utf-8'
-              suffix = ('\n' + add) if path == 'README.md' else add
-              p.write_text(text.rstrip('\n') + suffix, encoding=encoding, newline='')
-          
-          Path('TEST_REPORT_v0.3.8_UX_FINAL.md').write_text('''# PMN-003 MONTAZH v0.3.8 公開前UX最終調整\n\n## 変更したファイル\n- app.py\n- engine.py\n- README.md\n- README.txt\n- RELEASE_README.txt\n\n## 実装した項目\n1. 音声エンジンのプルダウンから「カスタム（詳細設定）」を削除。カスタム接続先は詳細設定に一本化。\n2. 閉じた Combobox / Spinbox 上のホイール操作で値を変更せず、外側フォームをスクロールするよう変更。\n3. Combobox の候補一覧を展開している場合は、Tk Listbox の標準ホイールスクロールを維持。\n4. 台本欄は内部スクロール可能時は台本を動かし、上下端に達した後の同方向ホイールを外側フォームへ引き継ぐよう変更。\n5. MP4正常完成後、同じ成果物フォルダへ完成時点の `.montazh` を自動保存。\n\n## 実施したテスト\n- Python構文検査: app.py / engine.py / timeline_widget.py / video_preview.py PASS\n- 静的確認: 音声エンジン選択肢が ENGINE_PRESETS のみであることを確認 PASS\n- 静的確認: 完成MP4確定後に `.montazh` を save_project() する経路を確認 PASS\n\n## 実機確認してほしい項目\n- 閉じた音声エンジン/話者/出力用途/出力サイズ上でホイールしても値が変わらず、画面がスクロールする。\n- 話者候補一覧を開いた状態ではホイールで候補一覧をスクロールできる。\n- 台本欄の途中では台本がスクロールし、最下端からさらに下へ回すと画面全体が下へ動く。上端も同様。\n- MP4完成後、完成MP4と同じフォルダに同名 `.montazh` が作成され、再読込できる。\n''', encoding='utf-8', newline='')
-          
-          print('UX migration applied')
-          PY
+          $version = python -c "import re; print(re.search('VERSION = \"([^\"]+)\"', open('engine.py', encoding='utf-8').read()).group(1))"
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "APP_VERSION=$version" >> $env:GITHUB_ENV
 
-      - name: Syntax and static checks
-        shell: bash
+      - name: Verify release tag matches application version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          $expected = "v$env:APP_VERSION"
+          if ("${{ github.ref_name }}" -ne $expected) {
+            throw "Release tag '${{ github.ref_name }}' does not match application version '$expected'."
+          }
+
+      - name: Syntax check
+        shell: pwsh
         run: |
           python -m py_compile app.py engine.py timeline_widget.py video_preview.py audio_preview.py bootstrap.py
-          python - <<'PY'
-          from pathlib import Path
-          a = Path('app.py').read_text(encoding='utf-8')
-          e = Path('engine.py').read_text(encoding='utf-8')
-          assert 'values=list(ENGINE_PRESETS)' in a
-          assert 'self._install_wheel_behavior()' in a
-          assert 'completed_project = job / f"{safe_title}.montazh"' in e
-          assert 'VERSION = "0.3.8"' in e
-          print('UX static checks: PASS')
-          PY
 
-      - name: Build Windows release candidate
+      - name: Build release ZIP
         shell: pwsh
         run: ./build_windows.ps1
 
-      - uses: actions/upload-artifact@v4
+      - name: Upload release candidate
+        uses: actions/upload-artifact@v4
         with:
-          name: PMN-003_MONTAZH-v0.3.8-UX-final-candidate
-          path: release/PMN-003_MONTAZH_v0.3.8_Windows_x64.zip
+          name: PMN-003_MONTAZH-Windows-x64
+          path: release/PMN-003_MONTAZH_v${{ steps.version.outputs.version }}_Windows_x64.zip
+          if-no-files-found: error
 
-      - name: Commit verified UX-final source
-        shell: bash
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download verified build
+        uses: actions/download-artifact@v4
+        with:
+          name: PMN-003_MONTAZH-Windows-x64
+          path: release-artifact
+
+      - name: Publish GitHub Release without overwriting an existing release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add app.py engine.py README.md README.txt RELEASE_README.txt TEST_REPORT_v0.3.8_UX_FINAL.md
-          git diff --cached --quiet && exit 0
-          git commit -m "Finalize PMN-003 MONTAZH v0.3.8 UX"
-          git push origin HEAD:main
+          $tag = "${{ github.ref_name }}"
+          $expected = "v${{ needs.build.outputs.app_version }}"
+          if ($tag -ne $expected) {
+            throw "Release tag '$tag' does not match application version '$expected'."
+          }
+
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            throw "Release '$tag' already exists. Refusing to overwrite an existing release asset."
+          }
+
+          $zip = Get-ChildItem "release-artifact" -Filter "PMN-003_MONTAZH_v*_Windows_x64.zip" | Select-Object -First 1
+          if (-not $zip) {
+            throw "Release ZIP was not found."
+          }
+
+          gh release create $tag $zip.FullName `
+            --title "PMN-003 MONTAZH $tag" `
+            --notes "Windows x64 public build of PMN-003 MONTAZH / 半自動映像構成装置. VOICEVOX or VOICEVOX Nemo is required separately."
