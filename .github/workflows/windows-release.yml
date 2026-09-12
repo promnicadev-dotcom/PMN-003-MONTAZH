@@ -96,4 +96,4 @@ jobs:
 
           gh release create $tag $zip.FullName `
             --title "PMN-003 MONTAZH $tag" `
-            --notes "Windows x64 public build of PMN-003 MONTAZH / 半自動映像構成装置. VOICEVOX or VOICEVOX Nemo is required separately."
+            --notes "Windows x64 public build of PMN-003 MONTAZH / 半自動映像構成装置. VOICEVOX or VOICEVOX Nemo and an external FFmpeg executable are required separately. See README.txt and THIRD_PARTY_NOTICES.txt."
