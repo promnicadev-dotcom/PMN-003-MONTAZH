@@ -1,0 +1,5 @@
+app.py text eol=lf
+engine.py text eol=lf
+README.md text eol=lf
+README.txt text eol=lf
+RELEASE_README.txt text eol=lf
