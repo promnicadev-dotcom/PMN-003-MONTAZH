@@ -26,7 +26,11 @@ jobs:
         id: version
         shell: pwsh
         run: |
-          $version = python -c "import re; print(re.search('VERSION = \"([^\"]+)\"', open('engine.py', encoding='utf-8').read()).group(1))"
+          $line = Select-String -Path "engine.py" -Pattern '^VERSION = "([^"]+)"$' | Select-Object -First 1
+          if (-not $line) {
+            throw "VERSION was not found in engine.py."
+          }
+          $version = $line.Matches[0].Groups[1].Value
           "version=$version" >> $env:GITHUB_OUTPUT
           "APP_VERSION=$version" >> $env:GITHUB_ENV
 
