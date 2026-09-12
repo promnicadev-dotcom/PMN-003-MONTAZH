@@ -1441,6 +1441,11 @@ def render(settings: Settings, log: Callable[[str], None] = print,
                     "-map", "0:v:0", "-map", "0:a:0", "-f", "null", "-"], cancel)
             final = job / f"{safe_title}.mp4"
             os.replace(pending, final)
+            # Preserve the exact project state that produced this successful MP4.
+            # This is written only after the MP4 has passed FFmpeg validation and been finalized.
+            completed_project = job / f"{safe_title}.montazh"
+            save_project(completed_project, settings)
+            report(f"完成プロジェクトを保存: {completed_project}")
         progress(100)
         report(f"完成: {final}")
         return final

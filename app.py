@@ -102,6 +102,7 @@ class FactoryApp(tk.Tk):
         self.controls = []
         self._style()
         self._build()
+        self._install_wheel_behavior()
         self.vars["engine_url"].trace_add("write", self._engine_url_changed)
         self.vars["theme_id"].trace_add("write", self._theme_changed)
         self._apply_ui_theme()
@@ -333,7 +334,7 @@ class FactoryApp(tk.Tk):
         self.var("engine_url", DEFAULT_ENGINE_URL)
         self.engine_choice_label = tk.StringVar(value=NEMO_ENGINE)
         self.engine_choice = ttk.Combobox(right, textvariable=self.engine_choice_label,
-            values=[*ENGINE_PRESETS, CUSTOM_ENGINE], state="readonly", width=32)
+            values=list(ENGINE_PRESETS), state="readonly", width=32)
         self.engine_choice.pack(fill="x")
         self.engine_choice.bind("<<ComboboxSelected>>", self._engine_selected)
         self.button(right, "声一覧を再読み込み", self._voices).pack(fill="x", pady=(7, 8))
@@ -412,25 +413,61 @@ class FactoryApp(tk.Tk):
         self.form_canvas.itemconfigure(self.form_window, width=width, height=height)
         self.form_canvas.configure(scrollregion=(0, 0, width, height))
 
+    @staticmethod
+    def _wheel_units(event):
+        if getattr(event, "num", None) in (4, 5):
+            return -1 if event.num == 4 else 1
+        delta = getattr(event, "delta", 0)
+        if delta:
+            return -int(delta / 120) or (-1 if delta > 0 else 1)
+        return 0
+
+    def _scroll_outer(self, units):
+        if not units or self.form_body.winfo_reqheight() <= self.form_canvas.winfo_height():
+            return
+        self.form_canvas.yview_scroll(units, "units")
+
     def _scroll_form(self, event):
         widget = event.widget
-        # Text/selection fields keep their own scrolling behavior.
-        if isinstance(widget, (tk.Text, tk.Listbox, ttk.Combobox, ttk.Spinbox)):
+        # Open combobox pop-downs are Tk Listboxes and keep native wheel scrolling.
+        # The script Text has its own edge-aware handoff handler below.
+        if isinstance(widget, (tk.Text, tk.Listbox)):
             return
         while widget is not None and widget is not self.form_body:
             widget = getattr(widget, "master", None)
         if widget is None and event.widget is not self.form_canvas:
             return
-        if self.form_body.winfo_reqheight() <= self.form_canvas.winfo_height():
+        units = self._wheel_units(event)
+        if not units:
             return
-        if getattr(event, "num", None) in (4, 5):
-            units = -1 if event.num == 4 else 1
-        elif event.delta:
-            units = -int(event.delta / 120) or (-1 if event.delta > 0 else 1)
-        else:
-            return
-        self.form_canvas.yview_scroll(units, "units")
+        self._scroll_outer(units)
         return "break"
+
+    def _wheel_control_to_outer(self, event):
+        # Closed Combobox/Spinbox: wheel means page navigation, never value changes.
+        # The expanded Combobox list is a separate Tk Listbox and remains scrollable.
+        self._scroll_outer(self._wheel_units(event))
+        return "break"
+
+    def _wheel_script_or_outer(self, event):
+        units = self._wheel_units(event)
+        if not units:
+            return "break"
+        first, last = self.script.yview()
+        can_scroll_inside = (units < 0 and first > 0.0001) or (units > 0 and last < 0.9999)
+        if can_scroll_inside:
+            self.script.yview_scroll(units, "units")
+        else:
+            self._scroll_outer(units)
+        return "break"
+
+    def _install_wheel_behavior(self):
+        # Replace ttk's default wheel-to-value behavior on closed selection controls.
+        # The drop-down itself is a Listbox, so long speaker lists still use the wheel normally.
+        for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            self.bind_class("TCombobox", sequence, self._wheel_control_to_outer)
+            self.bind_class("TSpinbox", sequence, self._wheel_control_to_outer)
+            self.script.bind(sequence, self._wheel_script_or_outer)
 
     def _engine_url_changed(self, *_):
         self.engine_choice_label.set(engine_preset(self.vars["engine_url"].get()))
@@ -441,9 +478,8 @@ class FactoryApp(tk.Tk):
 
     def _engine_selected(self, _event=None):
         label = self.engine_choice_label.get()
-        if label == CUSTOM_ENGINE:
-            self._advanced()
-            self.engine_choice_label.set(engine_preset(self.vars["engine_url"].get()))
+        # Custom endpoints are configured only from 詳細設定; they are not a drop-down item.
+        if label not in ENGINE_PRESETS:
             return
         if self.vars["engine_url"].get() != ENGINE_PRESETS[label]:
             self.vars["engine_url"].set(ENGINE_PRESETS[label])
