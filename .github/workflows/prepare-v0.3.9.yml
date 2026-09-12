@@ -1,0 +1,257 @@
+name: Prepare v0.3.9 maintenance release
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/prepare-v0.3.9.yml']
+
+permissions:
+  contents: write
+
+jobs:
+  prepare-release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Apply audited v0.3.9 maintenance fixes
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import subprocess
+
+          expected = {
+              'app.py': '5ef4bc4b97c274f482c3161168b3ff3e298f6d15',
+              'engine.py': '072c822dcb0d7b9f7dfbfe277aacfcf854916d3a',
+              'README.md': 'dab2881ac635f0090db9137bb1cbf34da9a21b4d',
+              'README.txt': '4bcbe1fbf59d0b6f25098bb3c84f991cfaea909c',
+              'RELEASE_README.txt': 'b7dab94ceb5608d12c6c22a85d47588acec7be7a',
+              'THIRD_PARTY_NOTICES.txt': '3d16538bb752309f9db8ef64413b255c2cca4cfb',
+              'build_windows.ps1': '2d57d44aa404e4e7bddd1ed51332fb2051e615d5',
+              '.github/workflows/windows-release.yml': '8a0463de0310a08f9cb69b320e9daf330a06c682',
+          }
+          for path, sha in expected.items():
+              actual = subprocess.check_output(['git', 'rev-parse', f'HEAD:{path}'], text=True).strip()
+              if actual != sha:
+                  raise SystemExit(f'{path}: unexpected base blob {actual}, expected {sha}')
+
+          def replace_once(path, old, new):
+              p = Path(path)
+              text = p.read_text(encoding='utf-8-sig' if path == 'RELEASE_README.txt' else 'utf-8')
+              if text.count(old) != 1:
+                  raise SystemExit(f'{path}: expected replacement exactly once, found {text.count(old)}')
+              encoding = 'utf-8-sig' if path == 'RELEASE_README.txt' else 'utf-8'
+              p.write_text(text.replace(old, new, 1), encoding=encoding, newline='')
+
+          def replace_count(path, old, new, expected_count):
+              p = Path(path)
+              text = p.read_text(encoding='utf-8')
+              count = text.count(old)
+              if count != expected_count:
+                  raise SystemExit(f'{path}: expected {expected_count} replacements, found {count}')
+              p.write_text(text.replace(old, new), encoding='utf-8', newline='')
+
+          # Version and local-settings schema.
+          replace_once('engine.py', 'VERSION = "0.3.8"', 'VERSION = "0.3.9"')
+          replace_once('engine.py', 'USER_SETTINGS_SCHEMA_VERSION = 1', 'USER_SETTINGS_SCHEMA_VERSION = 2')
+
+          # FFmpeg executable paths are machine-local and must not be persisted inside .montazh.
+          replace_once('engine.py',
+          '''def _project_payload(settings: Settings) -> bytes:\n    return json.dumps({"schema_version": PROJECT_SCHEMA_VERSION, "app_version": VERSION,\n                       "settings": asdict(settings)},\n                      ensure_ascii=False, indent=2).encode("utf-8")\n''',
+          '''def _project_payload(settings: Settings) -> bytes:\n    project_settings = asdict(settings)\n    # Executable paths are machine-local. Never persist an FFmpeg executable path\n    # inside a project that may be shared with another person or PC.\n    project_settings["ffmpeg_path"] = ""\n    return json.dumps({"schema_version": PROJECT_SCHEMA_VERSION, "app_version": VERSION,\n                       "settings": project_settings},\n                      ensure_ascii=False, indent=2).encode("utf-8")\n''')
+
+          replace_once('engine.py',
+              'def _validate_project_source_reference(settings: Settings) -> None:',
+              'def _validate_project_source_reference(settings: Settings, ffmpeg_path: str = "") -> None:')
+          replace_once('engine.py',
+              'probe_duration(find_ffmpeg(""), video, None)',
+              'probe_duration(find_ffmpeg(ffmpeg_path), video, None)')
+          replace_once('engine.py',
+              'def load_project(path: Path) -> Settings:',
+              'def load_project(path: Path, ffmpeg_path: str = "") -> Settings:')
+          replace_count('engine.py',
+              '_validate_project_source_reference(obj)',
+              '_validate_project_source_reference(obj, ffmpeg_path)', 2)
+          replace_once('engine.py',
+              'raise FactoryError("FFmpegが見つかりません。START.cmdを実行して初期準備を完了してください。") from exc',
+              'raise FactoryError("FFmpegが見つかりません。PATHに追加するか、詳細設定で ffmpeg.exe を指定してください。") from exc')
+
+          # Keep the local FFmpeg path across project loads without trusting a path stored in the project.
+          replace_once('app.py',
+          '''                loaded = load_project(target)  # Work state; UI is untouched until this succeeds.\n                self._apply(loaded)\n''',
+          '''                local_ffmpeg = self.vars["ffmpeg_path"].get().strip()\n                loaded = load_project(target, local_ffmpeg)  # Project files never choose an executable path.\n                loaded.ffmpeg_path = local_ffmpeg\n                self._apply(loaded)\n''')
+          replace_once('app.py',
+          '''                settings = load_project(path)\n                old_documents_default = (Path.home() / "Documents" / "MONTAZH").resolve()\n''',
+          '''                local_ffmpeg = self.vars["ffmpeg_path"].get().strip()\n                settings = load_project(path, local_ffmpeg)\n                settings.ffmpeg_path = local_ffmpeg\n                old_documents_default = (Path.home() / "Documents" / "MONTAZH").resolve()\n''')
+
+          replace_once('app.py',
+          '''                    "voicevox_dir_path": value if isinstance(value, str) else "",\n                    "default_output_dir": data.get("default_output_dir", "") if isinstance(data.get("default_output_dir", ""), str) else "",\n''',
+          '''                    "voicevox_dir_path": value if isinstance(value, str) else "",\n                    "ffmpeg_path": data.get("ffmpeg_path", "") if isinstance(data.get("ffmpeg_path", ""), str) else "",\n                    "default_output_dir": data.get("default_output_dir", "") if isinstance(data.get("default_output_dir", ""), str) else "",\n''')
+          replace_once('app.py',
+          '''            elif schema != USER_SETTINGS_SCHEMA_VERSION:\n                self._user_settings_writable = False\n''',
+          '''            elif schema == 1 and USER_SETTINGS_SCHEMA_VERSION == 2:\n                # v0.3.8 local settings did not store FFmpeg. Migrate in memory;\n                # the next normal save writes schema 2.\n                data = dict(data)\n                data["schema_version"] = USER_SETTINGS_SCHEMA_VERSION\n                data["ffmpeg_path"] = ""\n            elif schema != USER_SETTINGS_SCHEMA_VERSION:\n                self._user_settings_writable = False\n''')
+          replace_once('app.py',
+          '''            expected = {"schema_version", "voicevox_dir_path", "default_output_dir",\n                        "default_source_audio_volume", "window_geometry"}\n''',
+          '''            expected = {"schema_version", "voicevox_dir_path", "ffmpeg_path", "default_output_dir",\n                        "default_source_audio_volume", "window_geometry"}\n''')
+          replace_once('app.py',
+          '''            self.voicevox_dir_path.set(str(data["voicevox_dir_path"]))\n            if data["default_output_dir"]:\n''',
+          '''            self.voicevox_dir_path.set(str(data["voicevox_dir_path"]))\n            self.vars["ffmpeg_path"].set(str(data["ffmpeg_path"]))\n            if data["default_output_dir"]:\n''')
+          replace_once('app.py',
+          '''                "voicevox_dir_path": self.voicevox_dir_path.get().strip(),\n                "default_output_dir": self.vars["output_dir"].get().strip(),\n''',
+          '''                "voicevox_dir_path": self.voicevox_dir_path.get().strip(),\n                "ffmpeg_path": self.vars["ffmpeg_path"].get().strip(),\n                "default_output_dir": self.vars["output_dir"].get().strip(),\n''')
+          replace_once('app.py',
+              'VOICEVOXのフォルダ指定はこのPCだけに保存し、プロジェクトファイルには含めません。ヘッダー・テーマ・タイトルは『録画とタイトル』で編集し、プロジェクトごとに保存されます。',
+              'VOICEVOXのフォルダ指定とFFmpeg実行ファイルはこのPCだけに保存し、プロジェクトファイルには含めません。ヘッダー・テーマ・タイトルは『録画とタイトル』で編集し、プロジェクトごとに保存されます。')
+
+          # Public documentation.
+          replace_once('README.md',
+              'v0.3.8を正式版とし、以後は原則として新機能追加ではなく保守・不具合修正を行います。',
+              'v0.3.8を初回正式版とし、v0.3.9で公開後監査の修正を反映しました。以後は原則として新機能追加ではなく保守・不具合修正のみを行います。')
+          replace_once('README.md',
+              'release/PMN-003_MONTAZH_v0.3.8_Windows_x64.zip',
+              'release/PMN-003_MONTAZH_v0.3.9_Windows_x64.zip')
+          replace_once('README.md',
+          '''正式配布ZIPにはFFmpegバイナリを同梱しません。MONTAZHは外部FFmpegを利用します。\n利用者はFFmpegをPATHに配置するか、詳細設定で `ffmpeg.exe` を指定してください。\nこれにより、MONTAZHの配布物とFFmpegの再配布ライセンスを分離します。\n''',
+          '''正式配布ZIPには、MONTAZHが直接呼び出すスタンドアロンの `ffmpeg.exe` は同梱しません。\n利用者はFFmpegをPATHに配置するか、詳細設定で `ffmpeg.exe` を指定してください。指定パスはPCローカル設定にのみ保存され、`.montazh` には保存されません。\nなお、同梱するOpenCVコンポーネントにはOpenCV配布物の一部としてFFmpegベースの動画I/O DLLが含まれる場合があります。これはMONTAZHが外部実行する `ffmpeg.exe` とは別です。第三者ライセンスは `THIRD_PARTY_NOTICES.txt` と配布ZIP内の `licenses` フォルダを参照してください。\n''')
+          readme = Path('README.md')
+          text = readme.read_text(encoding='utf-8').rstrip() + '''\n\n## v0.3.9 最終メンテナンス版\n\n- v0.3.8 UX最終調整（ホイール操作、音声エンジン選択、完成時 `.montazh` 自動保存）を正式反映\n- PATHではなく詳細設定で指定したFFmpegでも `.montazh` を再読込できるよう修正\n- FFmpeg実行ファイルのパスをPCローカル設定へ移し、`.montazh` には保存しないよう整理\n- FFmpeg未検出時の案内をWindows配布版に合う内容へ修正\n- OpenCVに含まれ得るFFmpegベースの動画I/Oコンポーネントを第三者ライセンス表記へ明記\n- Windows配布ZIPへOpenCV / Pillowのライセンス文書を収録\n- 第三者表記のプロジェクトURLを現在の `promnica-lab` へ統一\n- GitHub Actionsは既存Releaseを上書きせず、タグとアプリバージョンが一致した場合だけ公開\n- 新機能追加ではなく、v0.3.8公開後監査に基づく保守修正のみ\n'''
+          readme.write_text(text, encoding='utf-8', newline='')
+
+          replace_once('README.txt', 'PMN-003 MONTAZH v0.3.8', 'PMN-003 MONTAZH v0.3.9')
+          p = Path('README.txt')
+          text = p.read_text(encoding='utf-8').rstrip() + '''\n- FFmpeg実行ファイルの指定はこのPCだけに保存し、.montazh には含めません。\n- v0.3.9は公開後監査で見つかった不具合・配布表記を修正した最終メンテナンス版です。\n'''
+          p.write_text(text, encoding='utf-8', newline='')
+
+          replace_once('RELEASE_README.txt', 'PMN-003 MONTAZH v0.3.8 - Windows x64', 'PMN-003 MONTAZH v0.3.9 - Windows x64')
+          replace_once('RELEASE_README.txt',
+          '''[FFmpegについて]\nこの配布ZIPにはFFmpegを同梱していません。\nFFmpegを別途インストールしてPATHを通すか、MONTAZHの「詳細設定」から ffmpeg.exe を指定してください。\n公式: https://ffmpeg.org/download.html\n''',
+          '''[FFmpegについて]\nこの配布ZIPには、MONTAZHが直接呼び出すスタンドアロンの ffmpeg.exe は同梱していません。\nFFmpegを別途インストールしてPATHを通すか、MONTAZHの「詳細設定」から ffmpeg.exe を指定してください。\n指定したffmpeg.exeのパスはこのPCだけに保存され、.montazh には含めません。\nOpenCVコンポーネントにはOpenCV配布物の一部としてFFmpegベースの動画I/O DLLが含まれる場合があります。\n第三者ライセンスは THIRD_PARTY_NOTICES.txt と licenses フォルダを確認してください。\n公式: https://ffmpeg.org/download.html\n''')
+
+          Path('THIRD_PARTY_NOTICES.txt').write_text('''PMN-003 MONTAZH - Third Party Notices\n\nStandalone FFmpeg executable\n----------------------------\nPMN-003 MONTAZH does not bundle the standalone ffmpeg.exe that the application\ninvokes for rendering and media inspection. Users provide that executable themselves,\neither through PATH or by selecting ffmpeg.exe in MONTAZH's detailed settings.\nFFmpeg is a separate open-source project distributed under its own license terms:\n  https://ffmpeg.org/legal.html\n  https://ffmpeg.org/download.html\n\nOpenCV / FFmpeg-based video I/O\n--------------------------------\nThe bundled OpenCV Python distribution may contain OpenCV's own FFmpeg-based video I/O\nbackend (for example, an opencv_videoio_ffmpeg*.dll). That component is part of the\nOpenCV distribution and is distinct from the standalone ffmpeg.exe used by MONTAZH.\nThe Windows release ZIP includes license files collected from the installed OpenCV and\nPillow package metadata under the licenses/ directory. Upstream information:\n  https://github.com/opencv/opencv-python\n  https://opencv.org/license/\n  https://python-pillow.github.io/\n\nVOICEVOX / VOICEVOX Nemo\n------------------------\nVOICEVOX / VOICEVOX Nemo are not bundled with MONTAZH. Users install and run them\nseparately. Generated audio must be used in accordance with the applicable\nVOICEVOX and speaker/voice terms.\n\nProject: https://github.com/promnica-lab/PMN-003-MONTAZH\n''', encoding='utf-8', newline='')
+
+          # Collect the exact license files shipped with the installed OpenCV/Pillow wheels.
+          replace_once('build_windows.ps1',
+          '''Copy-Item -Force "RELEASE_README.txt" "dist\\PMN-003_MONTAZH\\README.txt"\nCopy-Item -Force "THIRD_PARTY_NOTICES.txt" "dist\\PMN-003_MONTAZH\\THIRD_PARTY_NOTICES.txt"\n\n# Create a ready-to-upload ZIP for GitHub Releases.\n''',
+          '''Copy-Item -Force "RELEASE_README.txt" "dist\\PMN-003_MONTAZH\\README.txt"\nCopy-Item -Force "THIRD_PARTY_NOTICES.txt" "dist\\PMN-003_MONTAZH\\THIRD_PARTY_NOTICES.txt"\n\n# Preserve third-party license texts from the exact wheels used for this build.\n$licenseDir = "dist\\PMN-003_MONTAZH\\licenses"\nNew-Item -ItemType Directory -Force -Path $licenseDir | Out-Null\n$licenseCollector = @'\nfrom importlib.metadata import distribution\nfrom pathlib import Path\nimport shutil\n\ndest = Path(r"dist\\PMN-003_MONTAZH\\licenses")\nfor package, label in (("opencv-python-headless", "OpenCV"), ("Pillow", "Pillow")):\n    dist = distribution(package)\n    copied = 0\n    for item in dist.files or []:\n        text = str(item).replace("\\\\", "/")\n        leaf = Path(text).name\n        if ".dist-info/" not in text.lower():\n            continue\n        if not any(word in leaf.lower() for word in ("license", "copying", "notice")):\n            continue\n        source = Path(dist.locate_file(item))\n        if source.is_file():\n            shutil.copy2(source, dest / f"{label}_{leaf}")\n            copied += 1\n    if copied == 0:\n        raise SystemExit(f"No license metadata found for {package}")\n'@\n$licenseCollector | & $py -\nif ($LASTEXITCODE -ne 0) { throw "Failed to collect third-party license files." }\n\n# Create a ready-to-upload ZIP for GitHub Releases.\n''')
+
+          replace_once('.github/workflows/windows-release.yml',
+              '--notes "Windows x64 public build of PMN-003 MONTAZH / 半自動映像構成装置. VOICEVOX or VOICEVOX Nemo is required separately."',
+              '--notes "Windows x64 public build of PMN-003 MONTAZH / 半自動映像構成装置. VOICEVOX or VOICEVOX Nemo and an external FFmpeg executable are required separately. See README.txt and THIRD_PARTY_NOTICES.txt."')
+
+          Path('TEST_REPORT_v0.3.9.md').write_text('''# PMN-003 MONTAZH v0.3.9 maintenance release\n\n## Scope\nNo feature expansion. This release contains the v0.3.8 UX-final changes plus post-release audit fixes.\n\n## Fixes\n- Custom FFmpeg path is stored only in machine-local settings and reused when loading projects.\n- `.montazh` project serialization clears `ffmpeg_path` before writing.\n- FFmpeg-not-found guidance matches the Windows release workflow.\n- OpenCV/Pillow license metadata is collected into the Windows release ZIP.\n- Third-party project URL and FFmpeg/OpenCV notices were corrected.\n- Existing GitHub Releases are never overwritten by the normal release workflow.\n\n## Automated checks\n- Python syntax check for all application modules.\n- Project round-trip test with a machine-local custom FFmpeg path.\n- Verification that project.json does not persist the FFmpeg executable path.\n- Windows PyInstaller onedir build and ZIP generation.\n- ZIP structure and third-party license-file presence check.\n- Public tracked-file scan for known private-path / stale-identity markers.\n''', encoding='utf-8', newline='')
+
+          print('v0.3.9 maintenance patch applied')
+          PY
+
+      - name: Syntax and regression checks
+        shell: bash
+        run: |
+          python -m py_compile app.py engine.py timeline_widget.py video_preview.py audio_preview.py bootstrap.py
+          python - <<'PY'
+          from pathlib import Path
+          import tempfile, zipfile, json
+          import engine
+
+          assert engine.VERSION == '0.3.9'
+          assert engine.USER_SETTINGS_SCHEMA_VERSION == 2
+
+          with tempfile.TemporaryDirectory() as td:
+              root = Path(td)
+              video = root / 'source.mp4'
+              video.write_bytes(b'x')
+              fake_ffmpeg = root / 'ffmpeg.exe'
+              fake_ffmpeg.write_bytes(b'fake')
+              project = root / 'sample.montazh'
+              settings = engine.Settings(video=str(video), script='test', ffmpeg_path=str(fake_ffmpeg))
+              engine.save_project(project, settings)
+              with zipfile.ZipFile(project, 'r') as zf:
+                  payload = json.loads(zf.read('project.json').decode('utf-8'))
+                  assert payload['settings']['ffmpeg_path'] == ''
+
+              seen = {}
+              original_probe = engine.probe_duration
+              def fake_probe(ffmpeg, source, cancel=None):
+                  seen['ffmpeg'] = ffmpeg
+                  seen['source'] = source
+                  return 1.0
+              engine.probe_duration = fake_probe
+              try:
+                  loaded = engine.load_project(project, str(fake_ffmpeg))
+              finally:
+                  engine.probe_duration = original_probe
+              assert Path(seen['ffmpeg']) == fake_ffmpeg.resolve()
+              assert loaded.ffmpeg_path == ''
+
+          app_text = Path('app.py').read_text(encoding='utf-8')
+          assert 'loaded = load_project(target, local_ffmpeg)' in app_text
+          assert '"ffmpeg_path": self.vars["ffmpeg_path"].get().strip()' in app_text
+          print('v0.3.9 regression checks: PASS')
+          PY
+
+          if grep -R -n -I -E 'promnicadev-dotcom|promnica\.dev@gmail\.com|C:/Users/ty091|C:\\Users\\ty091' . --exclude-dir=.git; then
+            echo 'Public-source privacy/stale-identity scan failed.'
+            exit 1
+          fi
+
+      - name: Build Windows v0.3.9 candidate
+        shell: pwsh
+        run: ./build_windows.ps1
+
+      - name: Inspect release ZIP
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import zipfile
+          release = Path('release/PMN-003_MONTAZH_v0.3.9_Windows_x64.zip')
+          assert release.is_file(), release
+          with zipfile.ZipFile(release, 'r') as zf:
+              names = zf.namelist()
+              lower = [n.lower() for n in names]
+              assert any(n.endswith('/PMN-003_MONTAZH.exe') for n in names)
+              assert any(n.endswith('/THIRD_PARTY_NOTICES.txt') for n in names)
+              assert any('/licenses/' in n and 'opencv_' in n.lower() for n in names)
+              assert any('/licenses/' in n and 'pillow_' in n.lower() for n in names)
+              assert not any(n.endswith('/ffmpeg.exe') for n in lower)
+              readme_name = next(n for n in names if n.endswith('/README.txt'))
+              assert 'v0.3.9' in zf.read(readme_name).decode('utf-8-sig')
+          print('release ZIP inspection: PASS')
+          PY
+
+      - name: Publish v0.3.9 source, tag and release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if git ls-remote --exit-code --tags origin refs/tags/v0.3.9 >/dev/null 2>&1; then
+            echo 'v0.3.9 tag already exists; refusing to overwrite.'
+            exit 1
+          fi
+          if gh release view v0.3.9 >/dev/null 2>&1; then
+            echo 'v0.3.9 Release already exists; refusing to overwrite.'
+            exit 1
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm .github/workflows/prepare-v0.3.9.yml
+          git add app.py engine.py README.md README.txt RELEASE_README.txt THIRD_PARTY_NOTICES.txt build_windows.ps1 .github/workflows/windows-release.yml TEST_REPORT_v0.3.9.md
+          git commit -m "Release PMN-003 MONTAZH v0.3.9"
+          release_sha=$(git rev-parse HEAD)
+          git tag v0.3.9
+          git push origin HEAD:main
+          git push origin v0.3.9
+          git push origin HEAD:refs/heads/release/v0.3.9
+
+          gh release create v0.3.9 release/PMN-003_MONTAZH_v0.3.9_Windows_x64.zip \
+            --verify-tag \
+            --title "PMN-003 MONTAZH v0.3.9" \
+            --notes "Final maintenance release. Includes the v0.3.8 UX-final adjustments and post-release audit fixes: custom FFmpeg project loading, machine-local FFmpeg path handling, corrected FFmpeg/OpenCV notices, bundled OpenCV/Pillow license texts, and hardened release handling. VOICEVOX or VOICEVOX Nemo and an external FFmpeg executable are required separately."
+          echo "Published commit: $release_sha"
