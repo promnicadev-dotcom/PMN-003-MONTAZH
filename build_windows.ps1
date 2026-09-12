@@ -41,6 +41,35 @@ if (-not (Test-Path "dist\PMN-003_MONTAZH\PMN-003_MONTAZH.exe")) {
 Copy-Item -Force "RELEASE_README.txt" "dist\PMN-003_MONTAZH\README.txt"
 Copy-Item -Force "THIRD_PARTY_NOTICES.txt" "dist\PMN-003_MONTAZH\THIRD_PARTY_NOTICES.txt"
 
+# Preserve third-party license texts from the exact wheels used for this build.
+$licenseDir = "dist\PMN-003_MONTAZH\licenses"
+New-Item -ItemType Directory -Force -Path $licenseDir | Out-Null
+$licenseCollector = @'
+from importlib.metadata import distribution
+from pathlib import Path
+import shutil
+
+dest = Path(r"dist\PMN-003_MONTAZH\licenses")
+for package, label in (("opencv-python-headless", "OpenCV"), ("Pillow", "Pillow")):
+    dist = distribution(package)
+    copied = 0
+    for item in dist.files or []:
+        text = str(item).replace("\\", "/")
+        leaf = Path(text).name
+        if ".dist-info/" not in text.lower():
+            continue
+        if not any(word in leaf.lower() for word in ("license", "copying", "notice")):
+            continue
+        source = Path(dist.locate_file(item))
+        if source.is_file():
+            shutil.copy2(source, dest / f"{label}_{leaf}")
+            copied += 1
+    if copied == 0:
+        raise SystemExit(f"No license metadata found for {package}")
+'@
+$licenseCollector | & $py -
+if ($LASTEXITCODE -ne 0) { throw "Failed to collect third-party license files." }
+
 # Create a ready-to-upload ZIP for GitHub Releases.
 $version = (& $py -c "import engine; print(engine.VERSION)").Trim()
 $releaseDir = Join-Path $PSScriptRoot "release"

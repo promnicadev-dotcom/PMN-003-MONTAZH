@@ -26,9 +26,9 @@ from typing import Callable
 
 from PIL import Image, ImageDraw, ImageFont
 
-VERSION = "0.3.8"
+VERSION = "0.3.9"
 PROJECT_SCHEMA_VERSION = 3
-USER_SETTINGS_SCHEMA_VERSION = 1
+USER_SETTINGS_SCHEMA_VERSION = 2
 VOICEVOX_CONNECT_TIMEOUT = 5.0
 VOICEVOX_READ_TIMEOUT = 20.0
 VOICEVOX_SYNTHESIS_READ_TIMEOUT = 180.0
@@ -628,7 +628,7 @@ def find_ffmpeg(explicit: str = "") -> str:
         import imageio_ffmpeg
         return imageio_ffmpeg.get_ffmpeg_exe()
     except (ImportError, RuntimeError) as exc:
-        raise FactoryError("FFmpegが見つかりません。START.cmdを実行して初期準備を完了してください。") from exc
+        raise FactoryError("FFmpegが見つかりません。PATHに追加するか、詳細設定で ffmpeg.exe を指定してください。") from exc
 
 
 def default_output_root() -> Path:
@@ -1079,8 +1079,12 @@ def validate_settings(settings: Settings, require_voice=True) -> list[Scene]:
 
 
 def _project_payload(settings: Settings) -> bytes:
+    project_settings = asdict(settings)
+    # Executable paths are machine-local. Never persist an FFmpeg executable path
+    # inside a project that may be shared with another person or PC.
+    project_settings["ffmpeg_path"] = ""
     return json.dumps({"schema_version": PROJECT_SCHEMA_VERSION, "app_version": VERSION,
-                       "settings": asdict(settings)},
+                       "settings": project_settings},
                       ensure_ascii=False, indent=2).encode("utf-8")
 
 
@@ -1181,7 +1185,7 @@ def _settings_from_payload(payload: bytes) -> Settings:
         raise FactoryError("PMN-003のプロジェクトファイルを選択してください。") from exc
 
 
-def _validate_project_source_reference(settings: Settings) -> None:
+def _validate_project_source_reference(settings: Settings, ffmpeg_path: str = "") -> None:
     if not settings.video:
         raise FactoryError("プロジェクトの元動画参照が空です。")
     video = Path(settings.video).expanduser()
@@ -1197,12 +1201,12 @@ def _validate_project_source_reference(settings: Settings) -> None:
     # Project-load validation is intentionally content-agnostic: same path is the same
     # logical material, but the current bytes must still be a readable video.
     try:
-        probe_duration(find_ffmpeg(""), video, None)
+        probe_duration(find_ffmpeg(ffmpeg_path), video, None)
     except FactoryError as exc:
         raise FactoryError(f"元動画を正常に読み込めません: {video}") from exc
 
 
-def load_project(path: Path) -> Settings:
+def load_project(path: Path, ffmpeg_path: str = "") -> Settings:
     path = Path(path)
     if not path.is_file():
         raise FactoryError("プロジェクトファイルが見つかりません。")
@@ -1218,7 +1222,7 @@ def load_project(path: Path) -> Settings:
                 if len(payload) > 2 * 1024 * 1024:
                     raise FactoryError("プロジェクト情報が大きすぎます。")
                 obj = _settings_from_payload(payload)
-                _validate_project_source_reference(obj)
+                _validate_project_source_reference(obj, ffmpeg_path)
                 for info in archive.infolist():
                     m = re.fullmatch(r"audio_cache/([0-9a-f]{64})\.wav", info.filename)
                     if not m:
@@ -1237,7 +1241,7 @@ def load_project(path: Path) -> Settings:
             raise FactoryError("プロジェクトファイルが大きすぎます。")
         try:
             obj = _settings_from_payload(path.read_bytes())
-            _validate_project_source_reference(obj)
+            _validate_project_source_reference(obj, ffmpeg_path)
         except OSError as exc:
             raise FactoryError("プロジェクトファイルを読み込めませんでした。") from exc
 

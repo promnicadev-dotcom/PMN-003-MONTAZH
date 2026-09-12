@@ -1,4 +1,4 @@
-﻿PMN-003 MONTAZH v0.3.8 - Windows x64
+﻿PMN-003 MONTAZH v0.3.9 - Windows x64
 
 [起動方法]
 1. ZIPを任意のフォルダへ展開してください。
@@ -23,8 +23,11 @@
 再現手順、MONTAZHのバージョン、output/logs/app.log の該当部分を添えてください。
 
 [FFmpegについて]
-この配布ZIPにはFFmpegを同梱していません。
+この配布ZIPには、MONTAZHが直接呼び出すスタンドアロンの ffmpeg.exe は同梱していません。
 FFmpegを別途インストールしてPATHを通すか、MONTAZHの「詳細設定」から ffmpeg.exe を指定してください。
+指定したffmpeg.exeのパスはこのPCだけに保存され、.montazh には含めません。
+OpenCVコンポーネントにはOpenCV配布物の一部としてFFmpegベースの動画I/O DLLが含まれる場合があります。
+第三者ライセンスは THIRD_PARTY_NOTICES.txt と licenses フォルダを確認してください。
 公式: https://ffmpeg.org/download.html
 
 初回起動時の表示は汎用テンプレートです。ヘッダー・タイトル・テーマはMONTAZH上で変更できます。

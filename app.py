@@ -684,7 +684,9 @@ class FactoryApp(tk.Tk):
             self.update_idletasks()
             try:
                 target = Path(path)
-                loaded = load_project(target)  # Work state; UI is untouched until this succeeds.
+                local_ffmpeg = self.vars["ffmpeg_path"].get().strip()
+                loaded = load_project(target, local_ffmpeg)  # Project files never choose an executable path.
+                loaded.ffmpeg_path = local_ffmpeg
                 self._apply(loaded)
                 self.current_project = target
                 self.status.set("プロジェクトを復元しました。VOICEVOXを自動確認します。")
@@ -703,7 +705,9 @@ class FactoryApp(tk.Tk):
             path = legacy
         if path.is_file():
             try:
-                settings = load_project(path)
+                local_ffmpeg = self.vars["ffmpeg_path"].get().strip()
+                settings = load_project(path, local_ffmpeg)
+                settings.ffmpeg_path = local_ffmpeg
                 old_documents_default = (Path.home() / "Documents" / "MONTAZH").resolve()
                 try:
                     current = Path(settings.output_dir).expanduser().resolve() if settings.output_dir else None
@@ -769,7 +773,7 @@ class FactoryApp(tk.Tk):
                         self.vars[key].set(value)
                 ttk.Button(frame, text="選択", command=choose).grid(row=row + 1, column=1, padx=8)
         info_row = (len(fields) + 1) * 2
-        ttk.Label(frame, text="VOICEVOXのフォルダ指定はこのPCだけに保存し、プロジェクトファイルには含めません。ヘッダー・テーマ・タイトルは『録画とタイトル』で編集し、プロジェクトごとに保存されます。",
+        ttk.Label(frame, text="VOICEVOXのフォルダ指定とFFmpeg実行ファイルはこのPCだけに保存し、プロジェクトファイルには含めません。ヘッダー・テーマ・タイトルは『録画とタイトル』で編集し、プロジェクトごとに保存されます。",
                   style="Muted.TLabel", wraplength=560).grid(row=info_row, column=0, columnspan=2, sticky="w", pady=15)
         def close_advanced():
             self._save_user_settings()
@@ -832,20 +836,28 @@ class FactoryApp(tk.Tk):
                 migrated = {
                     "schema_version": USER_SETTINGS_SCHEMA_VERSION,
                     "voicevox_dir_path": value if isinstance(value, str) else "",
+                    "ffmpeg_path": data.get("ffmpeg_path", "") if isinstance(data.get("ffmpeg_path", ""), str) else "",
                     "default_output_dir": data.get("default_output_dir", "") if isinstance(data.get("default_output_dir", ""), str) else "",
                     "default_source_audio_volume": float(data.get("default_source_audio_volume", 20.0)),
                     "window_geometry": data.get("window_geometry", "") if isinstance(data.get("window_geometry", ""), str) else "",
                 }
                 data = migrated
+            elif schema == 1 and USER_SETTINGS_SCHEMA_VERSION == 2:
+                # v0.3.8 local settings did not store FFmpeg. Migrate in memory;
+                # the next normal save writes schema 2.
+                data = dict(data)
+                data["schema_version"] = USER_SETTINGS_SCHEMA_VERSION
+                data["ffmpeg_path"] = ""
             elif schema != USER_SETTINGS_SCHEMA_VERSION:
                 self._user_settings_writable = False
                 raise FactoryError(f"未対応の共通設定schema_versionです: {schema}")
-            expected = {"schema_version", "voicevox_dir_path", "default_output_dir",
+            expected = {"schema_version", "voicevox_dir_path", "ffmpeg_path", "default_output_dir",
                         "default_source_audio_volume", "window_geometry"}
             if set(data) != expected:
                 self._user_settings_writable = False
                 raise FactoryError("共通設定の項目構成が一致しません。旧設定は変更しません。")
             self.voicevox_dir_path.set(str(data["voicevox_dir_path"]))
+            self.vars["ffmpeg_path"].set(str(data["ffmpeg_path"]))
             if data["default_output_dir"]:
                 self.vars["output_dir"].set(str(data["default_output_dir"]))
             try:
@@ -873,6 +885,7 @@ class FactoryApp(tk.Tk):
             data = {
                 "schema_version": USER_SETTINGS_SCHEMA_VERSION,
                 "voicevox_dir_path": self.voicevox_dir_path.get().strip(),
+                "ffmpeg_path": self.vars["ffmpeg_path"].get().strip(),
                 "default_output_dir": self.vars["output_dir"].get().strip(),
                 "default_source_audio_volume": float(self.vars["source_audio_volume"].get()),
                 "window_geometry": self.geometry(),

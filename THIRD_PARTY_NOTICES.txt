@@ -1,19 +1,29 @@
 PMN-003 MONTAZH - Third Party Notices
 
-This Windows binary distribution does NOT bundle FFmpeg.
-
-MONTAZH invokes FFmpeg as an external program. Users must provide FFmpeg themselves
-(either install it in PATH or select ffmpeg.exe in MONTAZH's detailed settings).
-FFmpeg is a separate open-source project distributed under its own license terms.
-See the official FFmpeg license and download information:
+Standalone FFmpeg executable
+----------------------------
+PMN-003 MONTAZH does not bundle the standalone ffmpeg.exe that the application
+invokes for rendering and media inspection. Users provide that executable themselves,
+either through PATH or by selecting ffmpeg.exe in MONTAZH's detailed settings.
+FFmpeg is a separate open-source project distributed under its own license terms:
   https://ffmpeg.org/legal.html
   https://ffmpeg.org/download.html
 
-This application also uses third-party Python packages including Pillow and OpenCV.
-Their licenses remain applicable to the corresponding bundled components.
+OpenCV / FFmpeg-based video I/O
+--------------------------------
+The bundled OpenCV Python distribution may contain OpenCV's own FFmpeg-based video I/O
+backend (for example, an opencv_videoio_ffmpeg*.dll). That component is part of the
+OpenCV distribution and is distinct from the standalone ffmpeg.exe used by MONTAZH.
+The Windows release ZIP includes license files collected from the installed OpenCV and
+Pillow package metadata under the licenses/ directory. Upstream information:
+  https://github.com/opencv/opencv-python
+  https://opencv.org/license/
+  https://python-pillow.github.io/
 
+VOICEVOX / VOICEVOX Nemo
+------------------------
 VOICEVOX / VOICEVOX Nemo are not bundled with MONTAZH. Users install and run them
 separately. Generated audio must be used in accordance with the applicable
 VOICEVOX and speaker/voice terms.
 
-Project: https://github.com/promnicadev-dotcom/PMN-003-MONTAZH
+Project: https://github.com/promnica-lab/PMN-003-MONTAZH
